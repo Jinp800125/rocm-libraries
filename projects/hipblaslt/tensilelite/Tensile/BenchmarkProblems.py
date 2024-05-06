@@ -81,7 +81,7 @@ def _generateForkedSolutions(problemType, constantParams, forkPermutations, asse
         ptype = solution["ProblemType"]
         isa = solution["ISA"]
 
-        if len(mi) == 9:
+        if len(mi) == 9 or len(mi) == 10 or len(mi) == 13 or len(mi) == 15:
             miParams = matrixInstructionToMIParameters(mi, isa, wavefrontSize, ptype, workgroup, isaInfoMap)
             solution.update(miParams)
         elif len(mi) == 0:
