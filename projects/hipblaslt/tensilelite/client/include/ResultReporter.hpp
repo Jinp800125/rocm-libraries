@@ -224,9 +224,17 @@ namespace TensileLite
 
             virtual void preProblem(ContractionProblem* const problem) override {}
             virtual void postProblem() override {}
+            virtual void STEP2resetProblem() override {}
 
             virtual void preSolution(ContractionSolution* const solution) override {}
             virtual void postSolution() override {}
+
+            virtual void setPredictionIdx(int64_t solutionIdx, int64_t predictionIdx) {}
+
+            virtual int64_t getPerfIdx(int64_t solutionIdx) const
+            {
+                return -1;  // Default implementation returns -1 if not found
+            }
 
             virtual bool needMoreRunsInSolution() const override
             {

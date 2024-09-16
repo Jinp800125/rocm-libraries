@@ -64,9 +64,11 @@ namespace TensileLite
                                        std::vector<std::vector<size_t>> const& value) override;
 
             virtual void postProblem() override;
+            virtual void STEP2resetProblem() override {}
             virtual void postSolution() override;
 
             void finalizeReport() override;
+            void getTop(std::vector<int64_t> &v_top, int top_want) override {}
 
         private:
             template <typename T>

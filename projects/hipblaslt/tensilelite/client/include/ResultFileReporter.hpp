@@ -32,6 +32,7 @@
 #include <boost/program_options.hpp>
 
 #include <cstddef>
+#include <unordered_map>
 
 namespace TensileLite
 {
@@ -62,8 +63,12 @@ namespace TensileLite
 
             virtual void postProblem() override;
             virtual void postSolution() override;
+            virtual void STEP2resetProblem() override;
 
             void finalizeReport() override;
+            void getTop(std::vector<int64_t> &v_top, int top_want) override;
+            void setPredictionIdx(int64_t solutionIdx, int64_t predictionIdx) override;
+            int64_t getPerfIdx(int64_t solutionIdx) const;
 
         private:
             template <typename T>
@@ -84,6 +89,9 @@ namespace TensileLite
             double      m_fasterTimeUS            = -1.0;
             double      m_fastestTilesPerCu       = -1.0;
             double      m_fastestTotalGranularity = -1.0;
+            std::map<float,std::vector<int64_t>> m_top;
+            std::unordered_map<int64_t, int64_t> m_predictionIdx;  // solution index -> prediction index
+            std::unordered_map<int64_t, int64_t> m_perfIdx;  // solution index -> perf_idx
             // for merge rows
             int64_t                                                         m_currProbID = -1;
             std::map<int64_t, std::unordered_map<std::string, std::string>> m_probMap;

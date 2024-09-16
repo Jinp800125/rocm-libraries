@@ -1315,7 +1315,7 @@ namespace TensileLite
         uint32_t gsu = problem.getParams().gsu() > 0 ? problem.getParams().gsu() : autoGsuVal;
         if(gsu > 0)
             rv.numWorkGroups.y *= gsu;
-
+        // std::cout << "gsu: " << gsu << std::endl;
         if(sizeMapping.streamK != 0)
         {
             rv.numWorkGroups.x = sk.grid;

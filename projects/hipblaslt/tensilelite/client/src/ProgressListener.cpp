@@ -120,6 +120,8 @@ namespace TensileLite
 
         void ProgressListener::preSolution(ContractionSolution* const solution)
         {
+            if (VICTOR_LOG)
+                std::cout << __PRETTY_FUNCTION__ << solution->index << std::endl;
             m_reporter->report(ResultKey::SolutionName, solution->name());
             m_reporter->report(ResultKey::SolutionIndex, solution->index);
         }

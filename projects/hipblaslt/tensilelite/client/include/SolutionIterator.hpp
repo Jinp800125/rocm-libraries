@@ -110,6 +110,7 @@ namespace TensileLite
             }
 
             virtual void finalizeReport() override {}
+            virtual void getTop(std::vector<int64_t> &v_top, int top_want) override {}
 
             virtual int error() const override
             {
@@ -118,6 +119,7 @@ namespace TensileLite
 
             virtual bool                                 moreSolutionsInProblem() const = 0;
             virtual std::shared_ptr<ContractionSolution> getSolution()                  = 0;
+            virtual std::shared_ptr<ContractionSolution> getSolution(int i_SolutionIdx) = 0;
             virtual bool                                 runCurrentSolution();
 
             virtual void preProblem(ContractionProblem* const problem) override;
@@ -160,18 +162,22 @@ namespace TensileLite
 
             virtual void preProblem(ContractionProblem* const problem) override;
             virtual void postProblem() override;
+            virtual void STEP2resetProblem() override{m_Step = 1; if (VICTOR_LOG) { std::cout << "m_Step=1" << std::endl; std::cout << __PRETTY_FUNCTION__ << std::endl; }};
 
             virtual void preSolution(ContractionSolution* const solution) override;
             virtual void postSolution() override;
 
             virtual bool                                 moreSolutionsInProblem() const override;
             virtual std::shared_ptr<ContractionSolution> getSolution() override;
+            virtual std::shared_ptr<ContractionSolution> getSolution(int i_SolutionIdx) override;
             virtual bool                                 runCurrentSolution() override;
 
         private:
             std::vector<std::shared_ptr<ContractionSolution>> m_solutions;
             std::queue<std::pair<int,double>>                 m_qSolutionIdx;
             std::unordered_map<int,double>                    m_hitrate;
+            std::unordered_map<int,double>                    m_predictionIdx;
+            std::unordered_map<int,double>                    m_predictionPerformance;
 
             double m_predictionThreshold;
             double m_currentPrediction;
@@ -181,6 +187,7 @@ namespace TensileLite
 
             int m_currentSolutionIdx;
             int m_currentIdx;
+            int m_Step = 0;
 
             RunCriteria m_runCriteria;
         };
@@ -195,12 +202,14 @@ namespace TensileLite
 
             virtual void preProblem(ContractionProblem* const problem) override;
             virtual void postProblem() override;
+            virtual void STEP2resetProblem() override {};
 
             virtual void preSolution(ContractionSolution* const solution) override;
             virtual void postSolution() override;
 
             virtual bool                                 moreSolutionsInProblem() const override;
             virtual std::shared_ptr<ContractionSolution> getSolution() override;
+            virtual std::shared_ptr<ContractionSolution> getSolution(int i_SolutionIdx) override {}
 
         private:
             std::shared_ptr<ContractionSolution> m_currentSolution;
@@ -219,17 +228,21 @@ namespace TensileLite
 
             virtual void preProblem(ContractionProblem* const problem) override;
             virtual void postProblem() override;
+            virtual void STEP2resetProblem() override {}
 
             virtual void preSolution(ContractionSolution* const solution) override;
             virtual void postSolution() override;
 
             virtual bool                                 moreSolutionsInProblem() const override;
             virtual std::shared_ptr<ContractionSolution> getSolution() override;
+            virtual std::shared_ptr<ContractionSolution> getSolution(int i_SolutionIdx) override {}
 
         private:
             std::vector<std::shared_ptr<ContractionSolution>> m_solutions;
             std::queue<std::pair<int,double>>                 m_qSolutionIdx;
             std::unordered_map<int,double>                    m_hitrate;
+            std::unordered_map<int,double>                    m_predictionIdx;
+            std::unordered_map<int,double>                    m_predictionPerformance;
             int                                               m_numSolutions       = 1;
             int                                               m_currentSolutionIdx = 0;
             double                                            m_predictionThreshold;

@@ -37,7 +37,9 @@
 
 namespace TensileLite
 {
-
+    static int VICTOR_TUNNING = 0;
+    static int VICTOR_LOG = 0;
+    
     // Type wrapper that can be copied or assigned to in a threadsafe manner. Value cannot be modified
     // Intended for using value semantics with non-trivially copyable data
     template <typename T>

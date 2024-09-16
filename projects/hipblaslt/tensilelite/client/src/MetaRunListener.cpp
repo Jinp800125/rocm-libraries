@@ -85,30 +85,44 @@ namespace TensileLite
 
         void MetaRunListener::preProblem(ContractionProblem* const problem)
         {
+            if (VICTOR_LOG) std::cout << __func__ << std::endl;
             for(auto iter = m_listeners.begin(); iter != m_listeners.end(); iter++)
                 (*iter)->preProblem(problem);
         }
 
         void MetaRunListener::postProblem()
         {
+            if (VICTOR_LOG) std::cout << __func__ << std::endl;
             for(auto iter = m_listeners.rbegin(); iter != m_listeners.rend(); iter++)
                 (*iter)->postProblem();
         }
 
+        void MetaRunListener::STEP2resetProblem()
+        {
+            if (VICTOR_LOG) std::cout << __func__ << std::endl;
+            for(auto iter = m_listeners.rbegin(); iter != m_listeners.rend(); iter++)
+                (*iter)->STEP2resetProblem();
+        }
+
         void MetaRunListener::preSolution(ContractionSolution* const solution)
         {
+            if (VICTOR_LOG) std::cout << __func__ << std::endl;
             for(auto iter = m_listeners.begin(); iter != m_listeners.end(); iter++)
                 (*iter)->preSolution(solution);
         }
 
         void MetaRunListener::postSolution()
         {
+            if (VICTOR_LOG) std::cout << __func__ << std::endl;
             for(auto iter = m_listeners.rbegin(); iter != m_listeners.rend(); iter++)
+            {
                 (*iter)->postSolution();
+            }
         }
 
         bool MetaRunListener::needMoreRunsInSolution() const
         {
+            if (VICTOR_LOG) std::cout << __func__ << std::endl;
             for(auto iter = m_listeners.begin(); iter != m_listeners.end(); iter++)
                 if((*iter)->needMoreRunsInSolution())
                     return true;
@@ -227,6 +241,11 @@ namespace TensileLite
         {
             for(auto iter = m_listeners.begin(); iter != m_listeners.end(); iter++)
                 (*iter)->finalizeReport();
+        }
+        void MetaRunListener::getTop(std::vector<int64_t> &v_top, int top_want)
+        {
+            // for(auto iter = m_listeners.begin(); iter != m_listeners.end(); iter++)
+            //     (*iter)->getTop(v_top, top_want);
         }
 
         int MetaRunListener::error() const

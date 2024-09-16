@@ -142,6 +142,13 @@ namespace TensileLite
                     (*iter)->postProblem();
             }
 
+            virtual void STEP2resetProblem() override
+            {
+                if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
+                for(auto iter = m_reporters.rbegin(); iter != m_reporters.rend(); iter++)
+                    (*iter)->STEP2resetProblem();
+            }
+
             virtual void preSolution(ContractionSolution* const solution) override
             {
                 for(auto iter = m_reporters.begin(); iter != m_reporters.end(); iter++)
@@ -152,6 +159,24 @@ namespace TensileLite
             {
                 for(auto iter = m_reporters.rbegin(); iter != m_reporters.rend(); iter++)
                     (*iter)->postSolution();
+            }
+
+            virtual void setPredictionIdx(int64_t solutionIdx, int64_t predictionIdx) override
+            {
+                for(auto iter = m_reporters.begin(); iter != m_reporters.end(); iter++)
+                    (*iter)->setPredictionIdx(solutionIdx, predictionIdx);
+            }
+
+            virtual int64_t getPerfIdx(int64_t solutionIdx) const override
+            {
+                // Return the first non-negative value found, or -1 if none found
+                for(auto iter = m_reporters.begin(); iter != m_reporters.end(); iter++)
+                {
+                    int64_t perfIdx = (*iter)->getPerfIdx(solutionIdx);
+                    if(perfIdx >= 0)
+                        return perfIdx;
+                }
+                return -1;
             }
 
             virtual bool needMoreRunsInSolution() const override
@@ -266,6 +291,12 @@ namespace TensileLite
                 }
 
                 return 0;
+            }
+
+            virtual void getTop(std::vector<int64_t> &v_top, int top_want) override
+            {
+                for(auto iter = m_reporters.begin()+1; iter != m_reporters.end(); iter++)
+                    (*iter)->getTop(v_top, top_want);
             }
 
         private:

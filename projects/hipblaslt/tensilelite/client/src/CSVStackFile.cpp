@@ -77,6 +77,7 @@ namespace TensileLite
 
         void CSVStackFile::writeCurrentRow()
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             if(m_firstRow && !m_headers.empty())
                 writeRow(m_headers);
 
@@ -92,6 +93,7 @@ namespace TensileLite
 
         void CSVStackFile::readCurrentRow(std::unordered_map<std::string, std::string>& outMap)
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             // we still write the header to csv first, then read the data to map
             if(m_firstRow && !m_headers.empty())
                 writeRow(m_headers);
@@ -134,7 +136,9 @@ namespace TensileLite
                 firstCol = false;
             }
 
-            (*m_stream) << std::endl;
+            if (VICTOR_LOG)
+                std::cout << std::endl << __PRETTY_FUNCTION__ << std::endl;
+            (*m_stream) << " HERE" << std::endl;
         }
 
         std::string CSVStackFile::escape(std::string const& value)

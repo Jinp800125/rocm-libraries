@@ -97,6 +97,7 @@ namespace TensileLite
                  reportValue_vecOfSizes(std::string const&                      key,
                                         std::vector<std::vector<size_t>> const& value) override;
             void finalizeReport() override;
+            void getTop(std::vector<int64_t> &v_top, int top_want) override {}
 
         protected:
             hipDeviceProp_t m_props;

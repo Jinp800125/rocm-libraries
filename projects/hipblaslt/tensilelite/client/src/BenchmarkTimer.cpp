@@ -35,6 +35,9 @@
 #include <csignal>
 #include <cstddef>
 #include <thread>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 namespace TensileLite
 {
@@ -112,12 +115,23 @@ namespace TensileLite
             else
             {
                 // print this as an indication of end-of-problem
-                std::cout << "########################## " << std::endl;
+                // Get current time
+                auto now = std::chrono::system_clock::now();
+                auto time_t = std::chrono::system_clock::to_time_t(now);
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()) % 1000;
+                
+                std::stringstream ss;
+                ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+                ss << "." << std::setfill('0') << std::setw(3) << ms.count();
+                
+                std::cout << "########################## " << ss.str() << std::endl;
             }
         }
 
         void BenchmarkTimer::preSolution(ContractionSolution* const solution)
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             m_numEnqueuesInSolution = 0;
             m_timeInSolution        = double_millis::zero();
             m_skip_slow_solution    = false;
@@ -160,6 +174,7 @@ namespace TensileLite
 
         void BenchmarkTimer::postSolution()
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             bool   sol_is_skipped    = (m_skiprun_from_map || m_skip_slow_solution);
             double timePerEnqueue_us = !sol_is_skipped ? double_micros(m_timeInSolution).count()
                                                                  / m_numEnqueuesInSolution
@@ -189,6 +204,8 @@ namespace TensileLite
             int    usedCus     = std::min(tiles, perf.CUs);
             double gflopsPerCu = gflops / usedCus;
 
+            if (VICTOR_LOG)
+                std::cout << "BenchmarkTimer::postSolution() report::TimeUS\n";
             m_reporter->report(ResultKey::TimeUS, timePerEnqueue_us);
             m_reporter->report(ResultKey::SpeedGFlopsPerCu, gflopsPerCu);
             m_reporter->report(ResultKey::SpeedGFlops, gflops);

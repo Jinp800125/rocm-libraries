@@ -32,6 +32,10 @@
 #include <cstddef>
 #include <string>
 #include <unordered_set>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
 
 #include <boost/lexical_cast.hpp>
 #include <boost/program_options.hpp>
@@ -368,6 +372,8 @@ namespace TensileLite
 
             virtual void postSolution() override
             {
+                if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
+
                 std::unordered_map<std::string, std::string> curRow;
                 m_csvOutput.readCurrentRow(curRow);
                 bool  validation    = !(curRow[ResultKey::Validation] == "FAILED"
@@ -401,8 +407,29 @@ namespace TensileLite
                 if(m_rowLevel <= m_level)
                     printf("++++++++++++++++++++++++\n");
             }
+            virtual void STEP2resetProblem() override
+            {
+                if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
+                m_winner   = std::numeric_limits<double>::infinity();
+            };
 
             virtual void finalizeReport() override {}
+
+            virtual void getTop(std::vector<int64_t> &v_top, int top_want) override 
+            {
+                // Get current time
+                auto now = std::chrono::system_clock::now();
+                auto time_t = std::chrono::system_clock::to_time_t(now);
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()) % 1000;
+                
+                std::stringstream ss;
+                ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+                ss << "." << std::setfill('0') << std::setw(3) << ms.count();
+                
+                printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ %s\n", ss.str().c_str());
+                m_winner   = std::numeric_limits<double>::infinity();//CHECK
+            }
 
         private:
             LogLevel m_level;

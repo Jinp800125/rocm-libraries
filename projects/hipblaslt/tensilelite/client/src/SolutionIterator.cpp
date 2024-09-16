@@ -276,6 +276,7 @@ namespace TensileLite
             , m_runCriteria(runCriteria)
             , m_predictionThreshold(predictionThreshold)
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             m_firstSolutionIdx = firstSolutionIdx;
 
             if(m_firstSolutionIdx < 0)
@@ -296,7 +297,11 @@ namespace TensileLite
 
         void AllSolutionsIterator::preProblem(ContractionProblem* const problem)
         {
+            m_Step = 0;
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             SolutionIterator::preProblem(problem);
+
+            // m_currentSolutionIdx = m_firstSolutionIdx;
             if (m_predictionThreshold > 1.0)
             {
                 m_currentSolutionIdx = m_firstSolutionIdx;
@@ -327,6 +332,7 @@ namespace TensileLite
                             tbInfo[i] = formocast.getTieBreakerInfo();
                             performance.push_back(std::pair(i,predPerf.microSeconds));
                             m_hitrate[i] = predPerf.hitRate;
+                            // m_predictionIdx[i] = m_currentIdx;
                         }
                     }
                 }
@@ -388,12 +394,16 @@ namespace TensileLite
                     }
                 }
                 m_currentSolutionIdx = m_qSolutionIdx.front().first;
+                if (VICTOR_LOG) std::cout << "m_currentSolutionIdx : " << m_currentSolutionIdx << std::endl;
                 m_currentPrediction  = m_qSolutionIdx.front().second;
                 m_currentIdx = 0;
+                m_predictionIdx[m_currentSolutionIdx] = m_currentIdx;
+                m_reporter->setPredictionIdx(m_currentSolutionIdx, m_currentIdx);
 
                 std::cout<<"predict performance is "<<performance[0].second<<" us, idx = "<<performance[0].first<<std::endl;
                 //std::cout<<"Threshold performance is "<<threshhold<<std::endl;
                 //std::cout<<"Solution number is "<<m_qSolutionIdx.size()<<std::endl;
+                if (VICTOR_LOG) std::cout << "m_qSolutionIdx LEN" << m_qSolutionIdx.size() << std::endl;
             }
         }
 
@@ -401,18 +411,42 @@ namespace TensileLite
 
         void AllSolutionsIterator::preSolution(ContractionSolution* const solution)
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             m_reporter->report(ResultKey::SolutionLibraryIndex, solution->libraryLogicIndex);
             m_reporter->report(ResultKey::SolutionIndex, m_currentSolutionIdx);
+            
+            // 计算 GSU 值（与 ContractionSolution.cpp 第 1164 行逻辑相同）
+            uint32_t gsu = 1; // 默认值
+            auto* gemmProblem = dynamic_cast<ContractionProblemGemm*>(m_problem);
+            if (gemmProblem != nullptr) {
+                uint32_t gsu_from_params = gemmProblem->getParams().gsu();
+                uint32_t auto_gsu = 0;
+                try {
+                    auto_gsu = solution->calculateAutoGSU(*gemmProblem, m_hardware.get());
+                } catch (...) {
+                    // 如果计算失败，使用默认值
+                }
+                gsu = (gsu_from_params > 0) ? gsu_from_params : auto_gsu;
+            }
+            
             if (m_predictionThreshold > 1.0)
             {
                 m_reporter->report(ResultKey::SolutionProgress,
-                     concatenate(m_currentSolutionIdx, "/", m_lastSolutionIdx));
+                     concatenate(m_currentSolutionIdx, "/", m_lastSolutionIdx, ", gsu:", gsu));
                 
             }
             else
             {
-                m_reporter->report(ResultKey::SolutionProgress,
-                    concatenate("hitrate,",m_hitrate[m_currentSolutionIdx],",",m_currentSolutionIdx,"->",m_currentPrediction," us, ",m_currentIdx,", ",m_currentSolutionIdx,"/",m_lastSolutionIdx));
+                if (!m_Step)
+                    m_reporter->report(ResultKey::SolutionProgress,
+                        concatenate("hitrate,",m_hitrate[m_currentSolutionIdx],",",m_currentSolutionIdx,"->",m_currentPrediction," us, ",m_currentIdx,", ",m_currentSolutionIdx,"/",m_lastSolutionIdx,", gsu:", gsu));
+                        // concatenate("hitrate,",m_hitrate[m_currentSolutionIdx],",",m_currentSolutionIdx,"->",m_currentPrediction," us, ",m_currentIdx,"/",m_lastSolutionIdx));
+                else
+                {
+                    int64_t perf_idx = m_reporter->getPerfIdx(m_currentSolutionIdx);
+                    m_reporter->report(ResultKey::SolutionProgress,
+                        concatenate("hitrate,",m_hitrate[m_currentSolutionIdx],",",m_currentSolutionIdx,"->",m_predictionPerformance[m_currentSolutionIdx]," us, ",m_predictionIdx[m_currentSolutionIdx],"(",perf_idx,")",", ",m_currentSolutionIdx,"/",m_lastSolutionIdx,", gsu:", gsu));
+                }
             }
         }
 
@@ -424,14 +458,32 @@ namespace TensileLite
             }
             else
             {
-                m_currentIdx++;
-                m_qSolutionIdx.pop();
-                if(!m_qSolutionIdx.empty())
+                if (VICTOR_LOG)
+                    std::cout << __PRETTY_FUNCTION__ << m_currentSolutionIdx << " " << m_currentIdx << std::endl;
+
+                // m_currentSolutionIdx++;
+                if (!m_Step) 
                 {
-                    m_currentSolutionIdx = m_qSolutionIdx.front().first;
-                    m_currentPrediction  = m_qSolutionIdx.front().second;
+                    m_predictionIdx[m_currentSolutionIdx] = m_currentIdx;
+                    m_reporter->setPredictionIdx(m_currentSolutionIdx, m_currentIdx);
+                    m_predictionPerformance[m_currentSolutionIdx] = m_currentPrediction;
+                    m_currentIdx++;
+                    m_qSolutionIdx.pop();
+                    if(!m_qSolutionIdx.empty())
+                    {
+                        m_currentSolutionIdx = m_qSolutionIdx.front().first;
+                        m_currentPrediction  = m_qSolutionIdx.front().second;
+                    // m_predictionPerformance[m_currentSolutionIdx] = m_currentPrediction;
+                    }
+                    // m_predictionIdx[m_currentSolutionIdx] = m_currentIdx;
+                }
+                else
+                {
+                    m_currentPrediction = m_predictionPerformance[m_currentSolutionIdx];
+                    m_currentIdx = m_predictionIdx[m_currentSolutionIdx];
                 }
             }
+            // m_currentSolutionIdx++; // Victor check
         }
 
         bool AllSolutionsIterator::moreSolutionsInProblem() const
@@ -439,11 +491,18 @@ namespace TensileLite
             if (m_predictionThreshold > 1.0)
                 return m_currentSolutionIdx <= m_lastSolutionIdx;
             else
-                return !m_qSolutionIdx.empty();
+            {
+                if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
+                if (!m_Step) 
+                    return !m_qSolutionIdx.empty();
+                else
+                    return m_currentSolutionIdx <= m_lastSolutionIdx;
+            }
         }
 
         std::shared_ptr<ContractionSolution> AllSolutionsIterator::getSolution()
         {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
             auto iter = m_library->solutions.find(m_currentSolutionIdx);
             if(iter == m_library->solutions.end())
                 return std::shared_ptr<ContractionSolution>();
@@ -451,6 +510,18 @@ namespace TensileLite
             return iter->second;
         }
 
+        std::shared_ptr<ContractionSolution> AllSolutionsIterator::getSolution(int i_SolutionIdx)
+        {
+            if (VICTOR_LOG) std::cout << __PRETTY_FUNCTION__ << std::endl;
+            auto iter = m_library->solutions.find(i_SolutionIdx);
+            if(iter == m_library->solutions.end())
+                return std::shared_ptr<ContractionSolution>();
+
+            m_currentSolutionIdx = i_SolutionIdx;
+
+            return iter->second;
+        }
+        
         bool AllSolutionsIterator::runCurrentSolution()
         {
             auto solution = getSolution();
@@ -687,5 +758,6 @@ namespace TensileLite
         {
             return m_solutions[m_currentSolutionIdx];
         }
+
     } // namespace Client
 } // namespace TensileLite
