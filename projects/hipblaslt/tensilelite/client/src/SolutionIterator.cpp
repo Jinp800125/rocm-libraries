@@ -345,6 +345,10 @@ namespace TensileLite
                     if(m_predictionThreshold == 0.0)
                     {   
                         auto bestIdx = 0;
+#undef EXPERIMENTAL
+#define EXPERIMENTAL 0
+#if EXPERIMENTAL
+#else
                         if(auto gemmProblem = dynamic_cast<ContractionProblemGemm*>(problem))
                         {
                             Tensilelite::Formocast::TieBreakerInfo perfInfo;
@@ -363,6 +367,7 @@ namespace TensileLite
                                 }
                             }
                         }
+#endif
                         m_qSolutionIdx.push(performance[bestIdx]);
                         break;
                     }
