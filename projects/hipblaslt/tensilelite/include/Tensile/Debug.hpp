@@ -59,6 +59,8 @@ namespace TensileLite
 
         bool usePredictionLibrary() const;
 
+        int usePredictionSelection() const;
+
         bool printLibraryLogicIndex() const;
 
         bool naivePropertySearch() const;
@@ -133,6 +135,7 @@ namespace TensileLite
         int         m_experimentSelection = 0;
         int         m_solution_index      = -1;
         bool        m_predictionLib       = false;
+        int         m_predictionSelection = 0; // 0: origami, 1: formocast, 2: gridbased
         std::string m_metric              = "";
         int         m_gridbasedTopSols    = 1;
         bool        m_benchmark           = false;

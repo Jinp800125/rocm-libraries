@@ -28,9 +28,11 @@
 
 #include <atomic>
 #include <set>
+#include <tuple>
 #include <vector>
 
 #include <Tensile/UtilsOrigami.hpp>
+#include <formocast_predict.hpp>
 
 namespace TensileLite
 {
@@ -43,14 +45,18 @@ namespace TensileLite
      * specific sizes. At runtime, we find the benchmarked size that is closest
      * to the size asked for.
      */
+    using MinTBInfo         = Tensilelite::Formocast::MinTieBreakerInfo;
+    using FormoCastPerfInfo = std::tuple<int, double, MinTBInfo>;
     template <typename MyProblem, typename MySolution = typename MyProblem::Solution>
     struct ProblemPredictionLibrary : public SolutionLibrary<MyProblem, MySolution>
     {
+        std::unordered_map<int, std::shared_ptr<MySolution>> solutionmap_fc;
         std::unordered_map<int, std::shared_ptr<MySolution>> solutionmap;
         std::vector<origami::config_t>                       origami_config_list;
         std::unordered_map<origami::config_t, int>           origami_config_map;
 
         mutable std::atomic<bool> lastFindTopRetAll = false;
+        bool predictAlgo = 0; // 0: origami, 1: formocast
 
         static std::string Type()
         {
@@ -67,12 +73,82 @@ namespace TensileLite
             return concatenate(type(), solutionmap.size());
         }
 
+        static void setupFormoCast(Tensilelite::Formocast& formocast, Task& task)
+        {
+            auto& problem  = task.problem;
+            auto& solution = task.solution;
+
+            // GetProblemInfo
+            Tensilelite::Formocast::ProblemInfo problemInfo;
+            problemInfo.M          = solution.calculateDimensionM(problem);
+            problemInfo.N          = solution.calculateDimensionN(problem);
+            problemInfo.NumBatches = solution.calculateNumBatches(problem);
+
+            problemInfo.K          = problem.boundSize(0);
+            problemInfo.transA     = problem.transA();
+            problemInfo.transB     = problem.transB();
+            problemInfo.bpeA       = problem.a().elementBytes();
+            problemInfo.bpeB       = problem.b().elementBytes();
+            problemInfo.bpeD       = problem.d().elementBytes();
+            problemInfo.bpeCompute = problem.computeTypeElementSize();
+            problemInfo.swizzleTensorA = problem.swizzleTensorA();
+            problemInfo.swizzleTensorB = problem.swizzleTensorB();
+            problemInfo.dataType = problem.f32XdlMathOp() == rocisa::DataType::XFloat32 ?
+              Tensilelite::DataType::TF32 :
+              datatypeToFormocastDatatype(problem.computeInputType());
+
+            // GetSizeMapping
+            auto                                sizeMapping = solution.getSizeMapping();
+            Tensilelite::Formocast::SizeMapping sm;
+
+            sm.waveNum = sizeMapping.waveNum;
+
+            sm.macroTile[0]      = sizeMapping.macroTile.x;
+            sm.macroTile[1]      = sizeMapping.macroTile.y;
+            sm.matrixInstruction = sizeMapping.matrixInstruction;
+
+            sm.grvwA = sizeMapping.grvwA;
+            sm.grvwB = sizeMapping.grvwB;
+            sm.gwvwC = sizeMapping.gwvwC;
+            sm.gwvwD = sizeMapping.gwvwD;
+
+            sm.depthU             = sizeMapping.depthU;
+            sm.globalSplitU       = solution.calculateAutoGSU(problem, &task.hardware);
+            sm.workGroupMapping   = sizeMapping.workGroupMapping;
+            sm.globalAccumulation = sizeMapping.globalAccumulation;
+
+            sm.workGroupMappingXCC      = sizeMapping.workGroupMappingXCC;
+            sm.workGroupMappingXCCGroup = sizeMapping.workGroupMappingXCCGroup;
+            sm.globalSplitUCoalesced    = sizeMapping.globalSplitUCoalesced;
+            sm.globalSplitUWorkGroupMappingRoundRobin
+                = sizeMapping.globalSplitUWorkGroupMappingRoundRobin;
+
+            sm.CUOccupancy            = sizeMapping.CUOccupancy;
+            sm.PrefetchGlobalRead     = sizeMapping.PrefetchGlobalRead;
+            sm.MathClocksUnrolledLoop = sizeMapping.MathClocksUnrolledLoop;
+
+            sm.DirectToVgprA      = sizeMapping.DirectToVgprA;
+            sm.DirectToVgprB      = sizeMapping.DirectToVgprB;
+            sm.NumLoadsCoalescedA = sizeMapping.NumLoadsCoalescedA;
+            sm.NumLoadsCoalescedB = sizeMapping.NumLoadsCoalescedB;
+            sm.VectorWidthA       = sizeMapping.VectorWidthA;
+            sm.VectorWidthB       = sizeMapping.VectorWidthB;
+            sm.LocalSplitU        = sizeMapping.LocalSplitU;
+
+            sm.waveGroup = sizeMapping.waveGroup;
+
+            formocast.setProblem(problemInfo);
+            formocast.setSolution(sm);
+        }
+
         virtual std::shared_ptr<MySolution> getSolutionByIndex(MyProblem const& problem,
                                                                Hardware const&  hardware,
                                                                const int index) const override
         {
-            auto indexMatch = solutionmap.find(index);
-            if(indexMatch != solutionmap.end())
+            auto& used_pool = (predictAlgo == 0) ? solutionmap : solutionmap_fc;
+
+            auto indexMatch = used_pool.find(index);
+            if(indexMatch != used_pool.end())
                 return indexMatch->second;
             return nullptr;
         }
@@ -97,12 +173,19 @@ namespace TensileLite
                              SolutionLibrarySearchType searchType
                              = SolutionLibrarySearchType::DEFAULT) const override
         {
+            // TODO- Temp
+            if(predictAlgo == 0)
+                std::cout << "Entering PredictionLibrary::findAllSolutions(), Algo = Origami" << std::endl;
+            else
+                std::cout << "Entering PredictionLibrary::findAllSolutions(), Algo = FormoCast" << std::endl;
+
             bool                    debug = Debug::Instance().printPropertyEvaluation();
             SolutionSet<MySolution> rv;
             if(searchType == SolutionLibrarySearchType::DEFAULT)
                 return rv;
 
-            for(auto const& row : this->solutionmap)
+            auto& used_pool = (predictAlgo == 0) ? solutionmap : solutionmap_fc;
+            for(auto const& row : used_pool)
             {
                 if(debug)
                     std::cout << row.second->description() << std::endl;
@@ -123,7 +206,8 @@ namespace TensileLite
             if(searchType == SolutionLibrarySearchType::DEFAULT)
                 return rv;
 
-            for(auto const& row : this->solutionmap)
+            auto& used_pool = (predictAlgo == 0) ? solutionmap : solutionmap_fc;
+            for(auto const& row : used_pool)
             {
                 if(debug)
                     std::cout << row.second->description() << std::endl;
@@ -133,10 +217,13 @@ namespace TensileLite
             return rv;
         }
 
-        virtual SolutionVector<MySolution> findTopSolutions(MyProblem const& problem,
-                                                            Hardware const&  hardware,
-                                                            int numSolutions) const override
+        SolutionVector<MySolution> findTopSolutionsOrigami(MyProblem const& problem,
+                                                           Hardware const&  hardware,
+                                                           int numSolutions) const
         {
+            // TODO- Temp
+            std::cout << "Entering PredictionLibrary::findTopSolutionsOrigami()" << std::endl;
+
             SolutionVector<MySolution> rv;
             size_t                     m     = 1;
             size_t                     n     = 1;
@@ -205,6 +292,120 @@ namespace TensileLite
             // can't reach the requested number, means findTop already done its best
             lastFindTopRetAll = (rv.size() < numSolutions);
             return rv;
+        }
+
+        SolutionVector<MySolution> findTopSolutionsFormoCast(MyProblem const& problem,
+                                                             Hardware const&  hardware,
+                                                             int numSolutions) const
+        {
+            // TODO- Temp
+            //std::cout << "Entering PredictionLibrary::findTopSolutionsFormoCast()" << std::endl;
+
+            bool                           debug = Debug::Instance().printPropertyEvaluation();
+            SolutionVector<MySolution>     rv;
+            Tensilelite::Formocast         formocast;
+            std::vector<FormoCastPerfInfo> perfMetric; // sol_idx, micro-s, tieBreakerInfo
+            double                         bestMS = std::numeric_limits<double>::max();
+
+            hip::HipAMDGPU const*      pAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(&hardware);
+            const origami::hardware_t& analytical_hardware = *(pAMDGPU->analyticalHardware);
+            formocast.setHardware(origamiArchToFormocastArch(analytical_hardware.arch));
+
+            if(solutionmap_fc.size() == 0) {
+                throw std::runtime_error(
+                        "[findTopSolutionsFormoCast] No valid solutionmap_fc");
+            }
+
+            for(auto const& row : solutionmap_fc)
+            {
+                int  sol_idx  = row.first;
+                auto solution = row.second;
+
+                if(debug)
+                {
+                    std::cout << solution->description() << ": ";
+                }
+
+                if((*solution->hardwarePredicate)(hardware)
+                   && (*solution->problemPredicate)(problem))
+                {
+                    Task task(hardware, problem, *solution);
+                    setupFormoCast(formocast, task);
+                    // Note:
+                    //  formocast.predictedPerformance();
+                    //  formocast.getTieBreakerInfo(); // or getMinTieBreakerInfo()
+                    auto perf = formocast.predictedPerformance().microSeconds;
+                    bestMS    = std::min(bestMS, perf);
+                    perfMetric.push_back(
+                        std::make_tuple(sol_idx, perf, formocast.getMinTieBreakerInfo()));
+                }
+            }
+
+            if(perfMetric.size() == 0) {
+                throw std::runtime_error(
+                        "[findTopSolutionsFormoCast] No valid solutions");
+            }
+
+            // This sorting function handles m-second first, and then tie-breaker
+            auto comp = [&formocast, &bestMS](const FormoCastPerfInfo& metric1,
+                                              const FormoCastPerfInfo& metric2) {
+                double ms1 = std::get<1>(metric1);
+                double ms2 = std::get<1>(metric2);
+                // Version 1: first criteria is tie, need to use tie-breaker for the next criteria
+                //if(ms1 == ms2)
+                // Version 2: we only use tie-breaker to compare for those "faster enough" ones
+                if(ms1 < (1.1 * bestMS) && ms2 < (1.1 * bestMS))
+                {
+                    auto& tbInfo1 = std::get<2>(metric1);
+                    auto& tbInfo2 = std::get<2>(metric2);
+                    // guard for "strict-weak-ordering" in sorting...
+                    if(tbInfo1 == tbInfo2)
+                        return ms1 < ms2;
+
+                    // NOTE:
+                    // isBetter=true means 2nd is faster, false means Equal
+                    // so we need to put tbInfo1 in the 2nd arg.
+                    if(formocast.isBetter(tbInfo2, tbInfo1))
+                    {
+                        return true;
+                    }
+                    else if(formocast.isBetter(tbInfo1, tbInfo2))
+                    {
+                        return false;
+                    }
+                    else
+                    {
+                        return ms1 < ms2;
+                    }
+                }
+                // sort from: (small -> large) = (faster -> slower) , return TRUE means metric1 is faster
+                return ms1 < ms2;
+            };
+            std::sort(perfMetric.begin(), perfMetric.end(), comp);
+            for(int i = 0; i < perfMetric.size(); i++)
+            {
+                auto solution = solutionmap_fc.at(std::get<0>(perfMetric[i]));
+                rv.emplace_back(solution);
+                if(rv.size() == numSolutions)
+                {
+                    break;
+                }
+            }
+
+            // can't reach the requested number, means findTop already done its best
+            lastFindTopRetAll = (rv.size() < numSolutions);
+            return rv;
+        }
+
+        virtual SolutionVector<MySolution> findTopSolutions(MyProblem const& problem,
+                                                            Hardware const&  hardware,
+                                                            int numSolutions) const override
+        {
+            // TODO- Temp
+            if(predictAlgo == 0)
+                return findTopSolutionsOrigami(problem, hardware, numSolutions);
+            else
+                return findTopSolutionsFormoCast(problem, hardware, numSolutions);
         }
 
         virtual bool lastFindTopAlreadyRetAll() const override

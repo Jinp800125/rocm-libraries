@@ -1944,7 +1944,6 @@ namespace TensileLite
                 }
             };
 
-
             struct FreeSizeMatching
                 : public Predicate_CRTP<FreeSizeMatching, ContractionProblemGemm>
             {

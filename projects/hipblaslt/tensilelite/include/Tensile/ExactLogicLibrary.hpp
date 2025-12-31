@@ -133,6 +133,9 @@ namespace TensileLite
             SolutionSet<MySolution> rv;
             const bool              streamK = Debug::Instance().useExperimentalSelection() == 2;
             const auto&             excludedLib = Debug::Instance().excludedLibFromGetAll();
+            // const bool predictionLib = Debug::Instance().usePredictionLibrary();
+            const bool  use_predict   = Debug::Instance().usePredictionSelection() != 2; // origami or formocast
+            const bool  use_gridbased = Debug::Instance().usePredictionSelection() == 2;
 
             for(auto const& row : rows)
             {
@@ -144,6 +147,16 @@ namespace TensileLite
                     continue;
 
                 if(row.first.value->type() == "AMDGPU" && !row.first(problem, hardware))
+                    continue;
+
+                // if(predictionLib && ((row.first.value->type() == "EqualityMatching")
+                //                      || (row.first.value->type() == "RangeMatching")))
+                //     continue;
+
+                if(row.first.value->type() == "PredictionMatching" && !use_predict)
+                    continue;
+
+                if(row.first.value->type() == "GridBasedMatching" && !use_gridbased)
                     continue;
 
                 auto rowSolutions = row.second->findAllSolutions(problem, hardware, searchType);

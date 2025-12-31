@@ -145,6 +145,11 @@ namespace TensileLite
         return m_predictionLib;
     }
 
+    int Debug::usePredictionSelection() const
+    {
+        return m_predictionSelection;
+    }
+
     int Debug::getGridbasedTopSols() const
     {
         return m_gridbasedTopSols;
@@ -202,6 +207,14 @@ namespace TensileLite
         const char* prediction_only = std::getenv("TENSILE_PREDICTION_LIB");
         if(prediction_only)
             m_predictionLib = strtol(prediction_only, nullptr, 0) != 0;
+
+        const char* predict_select = std::getenv("TENSILE_PREDICTION_ALGO");
+        if(predict_select)
+            m_predictionSelection = strtol(predict_select, nullptr, 0); // 0, 1, 2
+
+        // const char* request_sol_neg1 = std::getenv("REQUESTED_SOLUTIONS_NEG1");
+        // if(request_sol_neg1)
+        //     m_request_neg1 = strtol(request_sol_neg1, nullptr, 0) != 0;
 
         const char* solution_index = std::getenv("TENSILE_SOLUTION_INDEX");
         if(solution_index)
