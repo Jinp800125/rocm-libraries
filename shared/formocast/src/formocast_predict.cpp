@@ -133,7 +133,7 @@ namespace Tensilelite
             double lwCycles = numGRA * lwA / waveNum;
             lwCycles += numGRB * lwB / waveNum;
 #undef EXPERIMENTAL
-#define EXPERIMENTAL 0
+#define EXPERIMENTAL 1
 #if EXPERIMENTAL
             double perf = std::max((grCycles2 + others + 1024) / math_frequency, mem_latency)
                           + (lwCycles*1 + grCycles2 + 1024) / math_frequency;
@@ -723,7 +723,7 @@ namespace Tensilelite
         uint32_t loopCnt = K_AfterGSU / depthU;
         uint32_t K_tail = K_AfterGSU - (loopCnt * depthU);
 #undef EXPERIMENTAL
-#define EXPERIMENTAL 0
+#define EXPERIMENTAL 1
 #if EXPERIMENTAL
         PGR = (std::floor(K_AfterGSU/depthU > 1)) ? sizeMapping.PrefetchGlobalRead : int(K_AfterGSU/depthU);
         int      PLR = (std::floor(K_AfterGSU/sizeMapping.LocalSplitU/depthU) < 1) ? 0: 1;//sizeMapping.PrefetchLocalRead;
@@ -883,7 +883,7 @@ namespace Tensilelite
         perf += (gsu_overall + lsu_overall);
 
 #undef EXPERIMENTAL
-#define EXPERIMENTAL 0
+#define EXPERIMENTAL 1
 #if EXPERIMENTAL
         if (int(M) % int(MT0) != 0)
             // perf += store_edge;
