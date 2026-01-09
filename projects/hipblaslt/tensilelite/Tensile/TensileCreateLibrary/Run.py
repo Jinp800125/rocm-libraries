@@ -841,10 +841,10 @@ def run():
             newMasterLibrary.applyNaming(splitGSU)
             LibraryIO.write(masterFile, state(newMasterLibrary), arguments["LibraryFormat"])
 
-            for name, lib in newMasterLibrary.lazyLibraries.items():
-                for k, s in lib.solutions.items():
-                    kName = getKeyNoInternalArgs(s.originalSolution, splitGSU)
-                    s.sizeMapping.CUOccupancy = solDict["%s"%kName]["CUOccupancy"]
+            # for name, lib in newMasterLibrary.lazyLibraries.items():
+            #     for k, s in lib.solutions.items():
+            #         kName = getKeyNoInternalArgs(s.originalSolution, splitGSU)
+            #         s.sizeMapping.CUOccupancy = solDict["%s"%kName]["CUOccupancy"]
 
             ParallelMap2(writeMsl,
                          newMasterLibrary.lazyLibraries.items(),

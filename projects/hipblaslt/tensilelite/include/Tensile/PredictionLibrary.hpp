@@ -315,15 +315,25 @@ namespace TensileLite
                 throw std::runtime_error(
                         "[findTopSolutionsFormoCast] No valid solutionmap_fc");
             }
-
-            for(auto const& row : solutionmap_fc)
+            // std::cout << "numSolutions: " << numSolutions << std::endl;
+            
+            // Sort by sol_idx (key) in ascending order
+            std::vector<std::pair<int, std::shared_ptr<MySolution>>> sorted_solutions(
+                solutionmap_fc.begin(), solutionmap_fc.end());
+            std::stable_sort(sorted_solutions.begin(), sorted_solutions.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+            
+            for(auto const& row : sorted_solutions)
+            // for(auto const& row : solutionmap_fc)
             {
                 int  sol_idx  = row.first;
                 auto solution = row.second;
 
                 if(debug)
                 {
+                    // std::cout << sol_idx << ": ";
                     std::cout << solution->description() << ": ";
+
                 }
 
                 if((*solution->hardwarePredicate)(hardware)
@@ -381,7 +391,8 @@ namespace TensileLite
                 // sort from: (small -> large) = (faster -> slower) , return TRUE means metric1 is faster
                 return ms1 < ms2;
             };
-            std::sort(perfMetric.begin(), perfMetric.end(), comp);
+            // std::reverse(perfMetric.begin(), perfMetric.end());
+            std::stable_sort(perfMetric.begin(), perfMetric.end(), comp);
             for(int i = 0; i < perfMetric.size(); i++)
             {
                 auto solution = solutionmap_fc.at(std::get<0>(perfMetric[i]));

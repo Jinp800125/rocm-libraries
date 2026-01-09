@@ -326,7 +326,8 @@ namespace TensileLite
                 }
 
                 auto comp = [](const std::pair<int, double>& e1, const std::pair<int, double>& e2) { return e1.second < e2.second; };
-                std::sort(performance.begin(),performance.end(),comp);
+                // std::cout<<"Hello "<<std::endl;
+                std::stable_sort(performance.begin(),performance.end(),comp);
                 // TODO: This is the simple threshold method.
                 // May use the best perf * 1.x as threshold in the future.
                 size_t index    = std::min(performance.size() - 1, size_t(performance.size() * m_predictionThreshold));
@@ -607,7 +608,7 @@ namespace TensileLite
                 }
 
                 auto comp = [](const std::pair<int, double>& e1, const std::pair<int, double>& e2) { return e1.second < e2.second; };
-                std::sort(performance.begin(),performance.end(),comp);
+                std::stable_sort(performance.begin(),performance.end(),comp);
                 size_t index    = std::min(performance.size() - 1, size_t(performance.size() * m_predictionThreshold));
                 auto threshhold = performance[index].second;
                 // push content
