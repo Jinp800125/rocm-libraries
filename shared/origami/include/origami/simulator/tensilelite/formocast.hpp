@@ -199,29 +199,36 @@ namespace origami
                                              int N_WGs_per_tile, int M_WGs_per_tile);
 
         /**
-         * @brief Compute L2 cache hit rate for matrix operations
-         * @param M Matrix dimension M
-         * @param N Matrix dimension N
-         * @param K Matrix dimension K
-         * @param MT0 Macro tile dimension 0
-         * @param MT1 Macro tile dimension 1
-         * @param depthU Depth unroll factor
-         * @param L2CacheCapacity L2 cache capacity in bytes
-         * @param NumCUs Number of compute units
-         * @param NumXCDs Number of XCDs (Extended Compute Dies)
-         * @param gsu Global split-U factor
-         * @param wgm Workgroup mapping strategy
-         * @param batches Number of batches
+         * @brief Compute L2 cache hit rate for matrix operations considering workgroup distribution
+         * 
+         * Simulates L2 cache behavior by tracking workgroup execution order and memory access patterns
+         * across multiple XCDs (Extended Compute Dies) to predict cache hit rates for matrix operands.
+         * 
+         * @param M Matrix dimension M (rows of output matrix)
+         * @param N Matrix dimension N (columns of output matrix)
+         * @param K Matrix dimension K (contraction dimension)
+         * @param MT0 Macro tile dimension 0 (tile size in M dimension)
+         * @param MT1 Macro tile dimension 1 (tile size in N dimension)
+         * @param depthU Depth unroll factor (K dimension tile size per iteration)
+         * @param L2CacheCapacity L2 cache capacity in bytes per XCD
+         * @param NumCUs Total number of compute units across all XCDs
+         * @param NumXCDs Number of XCDs (Extended Compute Dies/chiplets)
+         * @param XCC Workgroup mapping per XCC (compute chiplet within XCD)
+         * @param XCCG Workgroup mapping across XCC groups
+         * @param gsu Global Split-K factor (splits K dimension across workgroups)
+         * @param wgm Workgroup mapping strategy (positive for N-major, negative for M-major)
+         * @param batches Number of batched GEMMs
          * @param bpeA Bytes per element for matrix A
          * @param bpeB Bytes per element for matrix B
-         * @param NTA Non-temporal access hint for matrix A
-         * @param NTB Non-temporal access hint for matrix B
-         * @param isGSUWGMRR Whether using GSU WGM round-robin scheduling
-         * @return L2CacheHitRate structure containing total and per-tile hit rates
+         * @param NTA Non-temporal access hint for matrix A (controls cache bypass)
+         * @param NTB Non-temporal access hint for matrix B (controls cache bypass)
+         * @param isGSUWGMRR Whether using Global Split-K with round-robin workgroup mapping
+         * @return L2CacheHitRate structure containing total hit rate and per-tile (A/B) hit rates
          */
         L2CacheHitRate computeL2CacheHitRate(uint32_t M, uint32_t N, uint32_t K,
                                              uint32_t MT0, uint32_t MT1, uint32_t depthU,
                                              uint32_t L2CacheCapacity, uint32_t NumCUs, uint32_t NumXCDs,
+                                             uint32_t XCC, uint32_t XCCG,
                                              uint32_t gsu, int32_t wgm, uint32_t batches,
                                              uint32_t bpeA, uint32_t bpeB, int32_t NTA, int32_t NTB,
                                              bool isGSUWGMRR);

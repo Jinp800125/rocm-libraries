@@ -562,6 +562,7 @@ namespace origami
                                              uint32_t N,
                                              uint32_t K,
                                              const HardwareConstants& hw,
+                                             uint32_t XCC, uint32_t XCCG,
                                              uint32_t gsu,
                                              int32_t  wgm,
                                              uint32_t batches,

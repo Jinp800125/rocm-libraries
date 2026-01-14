@@ -386,6 +386,8 @@ namespace origami
         double MT1 = sizeMapping.macroTile[1];
         int      WGM = sizeMapping.workGroupMapping != 0 ? sizeMapping.workGroupMapping : 1;
         int      CUOccupancy = sizeMapping.CUOccupancy;
+        uint32_t XCC  = sizeMapping.workGroupMappingXCC;
+        uint32_t XCCG = (sizeMapping.workGroupMappingXCCGroup < 0)? hw_consts.NumCUs : sizeMapping.workGroupMappingXCCGroup;
         uint32_t depthU = sizeMapping.depthU;
 
         // Global split
@@ -512,6 +514,7 @@ namespace origami
                                                 N,
                                                 K_AfterGSU,
                                                 hw_consts,
+                                                XCC, XCCG,
                                                 GlobalSplitU,
                                                 WGM,
                                                 NumBatches,
@@ -692,6 +695,8 @@ namespace origami
         double MT1 = sizeMapping.macroTile[1];
         int      WGM = sizeMapping.workGroupMapping != 0 ? sizeMapping.workGroupMapping : 1;
         int      CUOccupancy = sizeMapping.CUOccupancy;
+        uint32_t XCC  = sizeMapping.workGroupMappingXCC;
+        uint32_t XCCG = (sizeMapping.workGroupMappingXCCGroup < 0)? hw_consts.NumCUs : sizeMapping.workGroupMappingXCCGroup;
         uint32_t depthU = sizeMapping.depthU;
 
         // Global split
@@ -766,6 +771,7 @@ namespace origami
                                                 N,
                                                 K_AfterGSU,
                                                 hw_consts,
+                                                XCC, XCCG,
                                                 GlobalSplitU,
                                                 WGM,
                                                 NumBatches,
@@ -1000,6 +1006,7 @@ namespace origami
                                                    uint32_t N,
                                                    uint32_t K,
                                                    const HardwareConstants& hw,
+                                                   uint32_t XCC, uint32_t XCCG,
                                                    uint32_t gsu,
                                                    int32_t  wgm,
                                                    uint32_t batches,
@@ -1015,7 +1022,7 @@ namespace origami
 
         auto hr = simulator::computeL2CacheHitRate(
             M, N, K, MT0, MT1, depthU, hw.L2CacheCapacity, hw.NumCUs, hw.NumXCDs,
-            gsu, wgm, batches, bpeA, bpeB, NTA, NTB, isGSUWGMRR);
+            XCC, XCCG, gsu, wgm, batches, bpeA, bpeB, NTA, NTB, isGSUWGMRR);
         
         L2CacheHitRate hitRate;
         hitRate.totalHitRate = hr.totalHitRate;
