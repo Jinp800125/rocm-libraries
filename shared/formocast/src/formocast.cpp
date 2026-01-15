@@ -468,7 +468,7 @@ namespace Tensilelite
             // loop each wg serial
             for(uint32_t wg = 0; wg < std::min(totalWGNum, 10 * NumCUs); wg++)
             {
-                //clean cache
+                // FIXME: clean cache by Capacity
                 if((wg % WGMXCCG) == 0)
                 {
                     // FIXME: loop every XCDs is disabled
@@ -526,6 +526,9 @@ namespace Tensilelite
 
                     //arrA.assign(wg0 * gsuMulBatch, 0);
                     //arrB.assign(wg1 * gsuMulBatch, 0);
+                    std::memset(arrA.data(), 0, arrA.size() * sizeof(uint32_t));
+                    std::memset(arrB.data(), 0, arrB.size() * sizeof(uint32_t));
+
                     std::memset(arrA_2.data(), 0, arrA_2.size() * sizeof(uint32_t));
                     std::memset(arrB_2.data(), 0, arrB_2.size() * sizeof(uint32_t));
                 }
@@ -598,6 +601,8 @@ namespace Tensilelite
                     xccMappedWGId = realWGId;
                 }
 
+                // xccMappedWGId = idxWG012 = 1D serial ID
+
                 int32_t  sgprWGM            = wgm;
                 uint32_t sgprNumWorkGroups0 = wg0;
                 uint32_t sgprNumWorkGroups1 = wg1;
@@ -618,9 +623,14 @@ namespace Tensilelite
                     gsuSumIdx      = sgprWorkGroup1 % gsu;
                     sgprWorkGroup1 = sgprWorkGroup1 / gsu;
                 }
-                // remapped wgid[0,1]
-                uint32_t finalwg1, finalwg0;
-                if(wgm > 0)
+
+                // remapped wgid[0,1]:
+                //  wgm > 1: WGMPositive
+                //  wgm < 0: WGMNegtive
+                //  wgm == 1 or 0: no remapping (default)
+                uint32_t finalwg0 = sgprWorkGroup0;
+                uint32_t finalwg1 = sgprWorkGroup1;
+                if(wgm > 1)
                 {
                     uint32_t v6  = sgprWorkGroup1 / sgprWGM;
                     uint32_t s84 = v6 * sgprWGM;
@@ -653,8 +663,7 @@ namespace Tensilelite
                     finalwg1 = sgprWorkGroup1;
                     finalwg0 = sgprWorkGroup0;
                 }
-                // auto wgm
-                else
+                else if(wgm < 0)
                 {
                     sgprWGM = 0 - sgprWGM;
 
@@ -691,32 +700,27 @@ namespace Tensilelite
                     finalwg0 = sgprWorkGroup0;
                     finalwg1 = sgprWorkGroup1;
                 }
+                bool isEdgeA = (finalwg0 == (wg0 - 1));
+                bool isEdgeB = (finalwg1 == (wg1 - 1));
+                uint32_t MT_Size0 = isEdgeA ? MT0_Edge : MT0;
+                uint32_t MT_Size1 = isEdgeB ? MT1_Edge : MT1;
                 // A
                 uint32_t idxA = (wg2 * gsu + gsuSumIdx) * wg0 + finalwg0;
                 if(isL2BypassA)
                 {
                     missA++;
-                    if(finalwg0 == wg0 - 1) //Edge
-                        aMissElements += (MT0_Edge * depthU);
-                    else
-                        aMissElements += (MT0 * depthU);
+                    aMissElements += (MT_Size0 * K);
                 }
                 else if((arrA[idxA] & (1 << xccIdx)) || (arrA_2[idxA] & (1 << xccIdx)))
                 {
                     hitA++;
-                    if(finalwg0 == (wg0 - 1)) //Edge
-                        aHitElements += (MT0_Edge * depthU);
-                    else
-                        aHitElements += (MT0 * depthU);
+                    aHitElements += (MT_Size0 * K);
                     arrA[idxA] |= (1 << xccIdx);
                 }
                 else
                 {
                     missA++;
-                    if(finalwg0 == wg0 - 1) //Edge
-                        aMissElements += (MT0_Edge * depthU);
-                    else
-                        aMissElements += (MT0 * depthU);
+                    aMissElements += (MT_Size0 * K);
                     arrA[idxA] |= (1 << xccIdx);
                 }
                 // B
@@ -724,27 +728,18 @@ namespace Tensilelite
                 if(isL2BypassB)
                 {
                     missB++;
-                    if(finalwg1 == (wg1 - 1)) //Edge
-                        bMissElements += (MT1_Edge * depthU);
-                    else
-                        bMissElements += (MT1 * depthU);
+                    bMissElements += (MT_Size1 * K);
                 }
                 else if((arrB[idxB] & (1 << xccIdx)) || (arrB_2[idxB] & (1 << xccIdx)))
                 {
                     hitB++;
-                    if(finalwg1 == (wg1 - 1)) //Edge
-                        bHitElements += (MT1_Edge * depthU);
-                    else
-                        bHitElements += (MT1 * depthU);
+                    bHitElements += (MT_Size1 * K);
                     arrB[idxB] |= (1 << xccIdx);
                 }
                 else
                 {
                     missB++;
-                    if(finalwg1 == (wg1 - 1)) //Edge
-                        bMissElements += (MT1_Edge * depthU);
-                    else
-                        bMissElements += (MT1 * depthU);
+                    bMissElements += (MT_Size1 * K);
                     arrB[idxB] |= (1 << xccIdx);
                 }
             }
