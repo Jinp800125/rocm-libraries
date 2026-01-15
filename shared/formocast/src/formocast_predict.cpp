@@ -999,11 +999,13 @@ namespace Tensilelite
     {
         uint32_t MT0 = sizeMapping.macroTile[0];
         uint32_t MT1 = sizeMapping.macroTile[1];
+        uint32_t XCC = sizeMapping.workGroupMappingXCC;
+        uint32_t XCCG = (sizeMapping.workGroupMappingXCCGroup < 0)? hw.NumCUs : sizeMapping.workGroupMappingXCCGroup;
         uint32_t depthU = sizeMapping.depthU;
 
         auto hr = Simulator::computeL2CacheHitRate(
             M, N, K, MT0, MT1, depthU, hw.L2CacheCapacity, hw.NumCUs, hw.NumXCDs,
-            gsu, wgm, batches, bpeA, bpeB, NTA, NTB, isGSUWGMRR);
+            XCC, XCCG, gsu, wgm, batches, bpeA, bpeB, NTA, NTB, isGSUWGMRR);
         
         L2CacheHitRate hitRate;
         hitRate.totalHitRate = hr.totalHitRate;

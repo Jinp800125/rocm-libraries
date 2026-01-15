@@ -122,7 +122,7 @@ namespace Tensilelite
 
             auto bpeIn  = bpeCompute;
             auto bpeOut = bpeD;
-            
+
             // Read write requests for VW=4 dwordx2 Half output
             if (bpeIn == 4 && bpeOut == 2 && ((int)M % 4) == 0)
             {
@@ -215,11 +215,11 @@ namespace Tensilelite
 #endif
         }
 
-        double getLSUOverhead(double MT0, double MT1, double lsu, uint32_t svw, 
+        double getLSUOverhead(double MT0, double MT1, double lsu, uint32_t svw,
                              uint32_t numThreads, uint32_t bpeCompute, double math_frequency)
         {
             if (lsu == 1) return 0.0;
-            
+
             double lsu_overall = 0.0;
             auto   bpeIn       = bpeCompute;
 
@@ -417,9 +417,9 @@ namespace Tensilelite
         L2CacheHitRate computeL2CacheHitRate(uint32_t M, uint32_t N, uint32_t K,
                                              uint32_t MT0, uint32_t MT1, uint32_t depthU,
                                              uint32_t L2CacheCapacity, uint32_t NumCUs, uint32_t NumXCDs,
-                                             uint32_t gsu, int32_t wgm, uint32_t batches,
-                                             uint32_t bpeA, uint32_t bpeB, int32_t NTA, int32_t NTB,
-                                             bool isGSUWGMRR)
+                                             uint32_t XCC, uint32_t XCCG, uint32_t gsu, int32_t wgm,
+                                             uint32_t batches, uint32_t bpeA, uint32_t bpeB, int32_t NTA,
+                                             int32_t NTB, bool isGSUWGMRR)
         {
             L2CacheHitRate hitRate;
 
@@ -443,8 +443,8 @@ namespace Tensilelite
             std::vector<uint32_t> arrA_2(gsuMulBatch * wg0, 0);
             std::vector<uint32_t> arrB_2(gsuMulBatch * wg1, 0);
 
-            uint32_t WGMXCC  = NumXCDs;
-            uint32_t WGMXCCG = NumCUs;
+            uint32_t WGMXCC  = XCC;
+            uint32_t WGMXCCG = (XCCG == -1)? NumCUs : XCCG;
             assert((WGMXCCG % WGMXCC) == 0);
 
             uint32_t totalWGNum  = gsuMulBatch * wg0 * wg1;
@@ -465,6 +465,7 @@ namespace Tensilelite
             uint32_t missA = 0;
             uint32_t missB = 0;
 
+            // loop each wg serial
             for(uint32_t wg = 0; wg < std::min(totalWGNum, 10 * NumCUs); wg++)
             {
                 //clean cache
@@ -529,44 +530,79 @@ namespace Tensilelite
                     std::memset(arrB_2.data(), 0, arrB_2.size() * sizeof(uint32_t));
                 }
 
-                // go xccgroup
-                uint32_t xccgIdx  = wg / WGMXCCG;
-                uint32_t realWGId = xccgIdx * WGMXCCG;
+                // ----------------------------------------------------------
+                //  XCD0     XCD1   XCD2     ...    XCDN-1  (NumXCD = N)
+                //  _____   _____   _____   _____   _____
+                // | wg0 | | wgX | |wg2X | |     | |     |  When we enable XCC and XCCG,
+                // | wg1 | |     | |     | |     | |     |  this is the result of "XCC/XCCG-remapped" wgIds
+                // |     | |     | |     | |     | |     |  (XCCG % XCC) must == 0,
+                // |     | |     | |     | |     | |     |  and each XCD has XCCG/XCC (=X) wgs.
+                // |wgX-1| |     | |     | |     | |     |
+                // |_____|_|_____|_|_____|_|_____|_|_____|  <---- Up to here, there are #-XCCG wgs. Note that X*N = XCCG
+                // | wgY | |     | |     | |     | |     |  <---- Note that wgY = wg(XCCG-1)+1
+                // |     | |     | |     | |     | |     |
+                //
+                // ----------------------------------------------------------
 
-                // get xccgroup wgNum
-                uint32_t xccgWgNum = std::min(WGMXCCG, totalWGNum - realWGId);
-                // how many wg per xcc in this xccgroup
-                uint32_t xccunit = xccgWgNum / WGMXCC;
-                uint32_t xccres  = xccgWgNum % WGMXCC;
-                // starting wgId
-                uint32_t resWGId = (wg - realWGId) % xccgWgNum;
-
-                // go xcc
-                uint32_t xccIdx = resWGId % WGMXCC;
-                // skip previous xcc
-                uint32_t skip = 0;
-                for(int i = 0; i < xccIdx; i++)
+                uint32_t xccMappedWGId;
+                uint32_t xccIdx;
+                // if XCC == 1, ignore all xcc/xccg setting
+                if(WGMXCC == 1)
                 {
-                    // skip i
-                    skip += xccunit;
-                    if(i < xccres)
-                    {
-                        // this xcc has extra 1 wg
-                        skip += 1;
-                    }
+                    xccMappedWGId = wg;
+                    xccIdx = wg % NumXCDs;
                 }
-                realWGId += skip;
+                else
+                {
+                    // go xccgroup
+                    uint32_t xccgIdx  = wg / WGMXCCG;
+                    // get rid of remainer: realWGId = starting wgID of this group
+                    uint32_t realWGId = xccgIdx * WGMXCCG;
 
-                // go inner xccid
-                // in XCCN, we get the idx of the wg in XCCN.
-                uint32_t innerXccId = resWGId / WGMXCC;
-                realWGId += innerXccId;
+                    // get xccgroup wgNum, normally is WGMXCCG, the later is for the last remaining wgs
+                    uint32_t xccgWgNum = std::min(WGMXCCG, totalWGNum - realWGId);
+                    // how many wgs per xcc in this xccgroup, i.e. X in the above, "stride" of each XCD
+                    uint32_t xccunit = xccgWgNum / WGMXCC;
+                    // should be 0 if not the last remaining wgs. for the last remaining wgs, it will be the xccId
+                    uint32_t xccres  = xccgWgNum % WGMXCC;
+
+                    // local wgId
+                    // wg-realWGID = local wgID in this group,
+                    // % xccgWgNum should be redundant, (perhaps for last remaining wgs)
+                    uint32_t resWGId = (wg - realWGId) % xccgWgNum;
+
+                    // Do xcc remapping:
+                    //  realWGId = starting WGID of this group,
+                    //  resWGId = local wgID in this group
+                    //  xccMappedWGId = realWGId + skip (offset)
+                    xccIdx = resWGId % WGMXCC; // this wg is in which XCD
+                    // skip previous xcc
+                    uint32_t skip = 0;
+                    for(int i = 0; i < xccIdx; i++)
+                    {
+                        // skip i ( + stride )
+                        skip += xccunit;
+                        if(i < xccres)
+                        {
+                            // this xcc has extra 1 wg
+                            skip += 1;
+                        }
+                    }
+                    realWGId += skip;
+
+                    // go inner xccid
+                    // in XCCN, we get the idx of the wg in XCCN.
+                    uint32_t innerOffset = resWGId / WGMXCC;
+                    realWGId += innerOffset;
+
+                    xccMappedWGId = realWGId;
+                }
 
                 int32_t  sgprWGM            = wgm;
                 uint32_t sgprNumWorkGroups0 = wg0;
                 uint32_t sgprNumWorkGroups1 = wg1;
-                uint32_t wg2     = realWGId / (sgprNumWorkGroups0 * sgprNumWorkGroups1 * gsu); //batch
-                uint32_t idxWG01 = realWGId - (wg2 * sgprNumWorkGroups0 * sgprNumWorkGroups1 * gsu);
+                uint32_t wg2     = xccMappedWGId / (sgprNumWorkGroups0 * sgprNumWorkGroups1 * gsu); //batch
+                uint32_t idxWG01 = xccMappedWGId - (wg2 * sgprNumWorkGroups0 * sgprNumWorkGroups1 * gsu);
                 uint32_t sgprWorkGroup1 = idxWG01 / wg0;
                 uint32_t sgprWorkGroup0 = idxWG01 - (sgprWorkGroup1 * wg0);
 
@@ -582,6 +618,7 @@ namespace Tensilelite
                     gsuSumIdx      = sgprWorkGroup1 % gsu;
                     sgprWorkGroup1 = sgprWorkGroup1 / gsu;
                 }
+                // remapped wgid[0,1]
                 uint32_t finalwg1, finalwg0;
                 if(wgm > 0)
                 {
@@ -616,6 +653,7 @@ namespace Tensilelite
                     finalwg1 = sgprWorkGroup1;
                     finalwg0 = sgprWorkGroup0;
                 }
+                // auto wgm
                 else
                 {
                     sgprWGM = 0 - sgprWGM;
@@ -653,6 +691,7 @@ namespace Tensilelite
                     finalwg0 = sgprWorkGroup0;
                     finalwg1 = sgprWorkGroup1;
                 }
+                // A
                 uint32_t idxA = (wg2 * gsu + gsuSumIdx) * wg0 + finalwg0;
                 if(isL2BypassA)
                 {
@@ -680,6 +719,7 @@ namespace Tensilelite
                         aMissElements += (MT0 * depthU);
                     arrA[idxA] |= (1 << xccIdx);
                 }
+                // B
                 uint32_t idxB = (wg2 * gsu + gsuSumIdx) * wg1 + finalwg1;
                 if(isL2BypassB)
                 {
@@ -729,7 +769,7 @@ namespace Tensilelite
         }
 
         // Store request calculation functions
-        double calculateStoreL3Request(double M, double N, double MT0, double MT1, 
+        double calculateStoreL3Request(double M, double N, double MT0, double MT1,
                                        double& non_edge_req, double& edge_req)
         {
             double result = 0.0;
@@ -1003,10 +1043,10 @@ namespace Tensilelite
             int LocalReadBytesA)
         {
             double ratioA = 1.0;
-            
+
             // Track bank usage for conflict analysis
             std::unordered_map<int, int> bankUsageA;
-            
+
             if(!vgprLocalReadAddrA.empty())
             {
                 for(int tid = 0; tid < NUM_THREADS_TO_SIMULATE; tid++)
@@ -1016,13 +1056,13 @@ namespace Tensilelite
                         int64_t addrA = vgprState[tid].at(vgprLocalReadAddrA);
                         int64_t startAddr = addrA;
                         int64_t endAddr = addrA + LocalReadBytesA - 1;
-                        
+
                         // Calculate which banks are accessed by the read range [startAddr, endAddr]
                         int startBankA = (startAddr / BANK_WIDTH) % NUM_BANKS;
-                        
+
                         // Number of BANK_WIDTH-sized chunks this read spans
                         int numBanksAccessed = (endAddr / BANK_WIDTH) - (startAddr / BANK_WIDTH) + 1;
-                        
+
                         // Account for all banks accessed by this LocalReadBytesA read
                         for(int i = 0; i < numBanksAccessed; i++)
                         {
@@ -1031,7 +1071,7 @@ namespace Tensilelite
                         }
                     }
                 }
-                
+
                 // Analyze bank conflicts
                 if(!bankUsageA.empty())
                 {
@@ -1046,7 +1086,7 @@ namespace Tensilelite
                     ratioA = (avgUsageA > 0) ? (double)maxUsageA / avgUsageA : 1.0;
                 }
             }
-            
+
             return ratioA;
         }
     }
