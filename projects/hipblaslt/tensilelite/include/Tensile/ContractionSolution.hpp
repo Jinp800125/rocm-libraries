@@ -240,11 +240,6 @@ namespace TensileLite
         {
             return kernelName;
         }
-<<<<<<< HEAD
-
-=======
-        virtual std::string matchingTag() const;
->>>>>>> ffd78a2770... [Formocast][TensileLite] Enable tuning and prediction library
         virtual bool isFallbackForHW(Hardware const&) const;
 
         bool isStreamK() const
