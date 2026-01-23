@@ -32,7 +32,7 @@
 #include <vector>
 
 #include <Tensile/UtilsOrigami.hpp>
-#include <formocast_predict.hpp>
+#include <origami/simulator/tensilelite/formocast_simulator.hpp>
 
 namespace TensileLite
 {
@@ -45,7 +45,7 @@ namespace TensileLite
      * specific sizes. At runtime, we find the benchmarked size that is closest
      * to the size asked for.
      */
-    using MinTBInfo         = Tensilelite::Formocast::MinTieBreakerInfo;
+    using MinTBInfo         = origami::Formocast::MinTieBreakerInfo;
     using FormoCastPerfInfo = std::tuple<int, double, MinTBInfo>;
     template <typename MyProblem, typename MySolution = typename MyProblem::Solution>
     struct ProblemPredictionLibrary : public SolutionLibrary<MyProblem, MySolution>
@@ -73,13 +73,13 @@ namespace TensileLite
             return concatenate(type(), solutionmap.size());
         }
 
-        static void setupFormoCast(Tensilelite::Formocast& formocast, Task& task)
+        static void setupFormoCast(origami::Formocast& formocast, Task& task)
         {
             auto& problem  = task.problem;
             auto& solution = task.solution;
 
             // GetProblemInfo
-            Tensilelite::Formocast::ProblemInfo problemInfo;
+            origami::Formocast::ProblemInfo problemInfo;
             problemInfo.M          = solution.calculateDimensionM(problem);
             problemInfo.N          = solution.calculateDimensionN(problem);
             problemInfo.NumBatches = solution.calculateNumBatches(problem);
@@ -94,12 +94,12 @@ namespace TensileLite
             problemInfo.swizzleTensorA = problem.swizzleTensorA();
             problemInfo.swizzleTensorB = problem.swizzleTensorB();
             problemInfo.dataType = problem.f32XdlMathOp() == rocisa::DataType::XFloat32 ?
-              Tensilelite::DataType::TF32 :
+              origami::data_type_t::XFloat32 :
               datatypeToFormocastDatatype(problem.computeInputType());
 
             // GetSizeMapping
             auto                                sizeMapping = solution.getSizeMapping();
-            Tensilelite::Formocast::SizeMapping sm;
+            origami::Formocast::SizeMapping sm;
 
             sm.waveNum = sizeMapping.waveNum;
 
@@ -305,13 +305,13 @@ namespace TensileLite
 
             bool                           debug = Debug::Instance().printPropertyEvaluation();
             SolutionVector<MySolution>     rv;
-            Tensilelite::Formocast         formocast;
+            origami::Formocast             formocast;
             std::vector<FormoCastPerfInfo> perfMetric; // sol_idx, micro-s, tieBreakerInfo
             double                         bestMS = std::numeric_limits<double>::max();
 
             hip::HipAMDGPU const*      pAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(&hardware);
             const origami::hardware_t& analytical_hardware = *(pAMDGPU->analyticalHardware);
-            formocast.setHardware(origamiArchToFormocastArch(analytical_hardware.arch));
+            formocast.setHardware(analytical_hardware.arch);
 
             if(solutionmap_fc.size() == 0) {
                 throw std::runtime_error(

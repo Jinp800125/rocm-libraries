@@ -48,7 +48,6 @@ if(TENSILELITE_ENABLE_HOST)
         PUBLIC
             $<BUILD_INTERFACE:rocisa::rocisa-cpp>
             roc::origami
-            roc::formocast
         PRIVATE
             hip::device
     )

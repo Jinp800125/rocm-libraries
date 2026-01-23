@@ -39,7 +39,7 @@
 #include <unordered_map>
 #include <climits>
 
-#include "formocast_predict.hpp"
+#include <origami/simulator/tensilelite/formocast_simulator.hpp>
 
 using MacroArguments = std::vector<std::tuple<std::string, std::string>>;
 using MacroEntity = std::tuple<std::shared_ptr<rocisa::Macro>, std::shared_ptr<MacroArguments>>;
@@ -673,7 +673,7 @@ namespace rocisa
     }
 
     // Helper function to analyze bank conflicts in local read address calculation
-    Tensilelite::Formocast::BankConflictResult _countLocalReadBankConflicts(Tensilelite::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, MacroTable& macros, int LocalReadBytesA, int LocalReadBytesB)
+    origami::Formocast::BankConflictResult _countLocalReadBankConflicts(origami::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, MacroTable& macros, int LocalReadBytesA, int LocalReadBytesB)
     {
         std::vector<std::shared_ptr<Item>> moduleInst;
         _popInst(module, moduleInst, macros);
@@ -765,7 +765,7 @@ namespace rocisa
     }
 
     // Helper function to count cycles
-    int _countCycles(Tensilelite::Formocast& formocast, std::shared_ptr<Module> item, int numWaves, MacroTable& macros, std::pair<double, double> bankConflicts)
+    int _countCycles(origami::Formocast& formocast, std::shared_ptr<Module> item, int numWaves, MacroTable& macros, std::pair<double, double> bankConflicts)
     {
         std::vector<std::shared_ptr<Item>> moduleInst;
         _popInst(item, moduleInst, macros);
@@ -884,7 +884,7 @@ namespace rocisa
                     }
                 }
 
-                cycles = formocast.checkLocalReadFIFOFull(currCycles, hwLRFIFO, bpr, numWaves, true, bankConflict);
+                cycles = formocast.getLocalReadQueueFullStallCycles(currCycles, hwLRFIFO, bpr, numWaves, true, bankConflict);
                 formocast.pushLocalReadWrite(cycles, lgkmLRFIFO, bpr, bankConflict);
             }
             else if(auto rwInst = std::dynamic_pointer_cast<ReadWriteInstruction>(item))
@@ -898,7 +898,7 @@ namespace rocisa
                     } else if (auto gr64 = std::dynamic_pointer_cast<BufferLoadB64>(grInst)) {
                         bpr = 8;
                     }
-                    cycles = formocast.checkGlobalReadFIFOFull(currCycles, hwGRFIFO, bpr, numWaves, false);
+                    cycles = formocast.getGlobalReadQueueFullStallCycles(currCycles, hwGRFIFO, bpr, numWaves, false);
                 }
                 if(auto wInst = std::dynamic_pointer_cast<DSStoreB128>(item))
                 {
@@ -935,7 +935,7 @@ namespace rocisa
             else if(auto waitInst = std::dynamic_pointer_cast<_SWaitCnt>(item))
             {
                 auto numLR = waitInst->getParams();
-                cycles = formocast.checkLocalReadFinished(cycles + 1, lgkmLRFIFO, std::stoi(InstructionInputToString(numLR[0])));
+                cycles = formocast.getLocalReadCompletionCycle(cycles + 1, lgkmLRFIFO, std::stoi(InstructionInputToString(numLR[0])));
             }
             else if(auto branchInst = std::dynamic_pointer_cast<BranchInstruction>(item))
             {
@@ -985,14 +985,14 @@ namespace rocisa
         }
         return cycles;
     }
-    int _countCycles(Tensilelite::Formocast& formocast, std::shared_ptr<Module> item, int numWaves, std::pair<double, double> bankConflicts)
+    int _countCycles(origami::Formocast& formocast, std::shared_ptr<Module> item, int numWaves, std::pair<double, double> bankConflicts)
     {
         MacroTable macros;
         return _countCycles(formocast, item, numWaves, macros, bankConflicts);
     }
 
     // Helper function to recursively find and analyze Local Read Addresses module
-    std::pair<double, double> _findAndAnalyzeLocalReadAddresses(Tensilelite::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, MacroTable& macros, int LocalReadBytesA, int LocalReadBytesB, int depth = 0)
+    std::pair<double, double> _findAndAnalyzeLocalReadAddresses(origami::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, MacroTable& macros, int LocalReadBytesA, int LocalReadBytesB, int depth = 0)
     {
         std::string indent(depth * 2, ' ');
         
@@ -1021,7 +1021,7 @@ namespace rocisa
     }
 
     // Function to find and analyze Local Read Addresses module for bank conflicts
-    std::pair<double, double> analyzeBankConflicts(Tensilelite::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, int LocalReadBytesA, int LocalReadBytesB)
+    std::pair<double, double> analyzeBankConflicts(origami::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, int LocalReadBytesA, int LocalReadBytesB)
     {
         MacroTable macros;
         _getMacros(module, macros);
@@ -1038,7 +1038,7 @@ namespace rocisa
     }
 
     // Function to calculate math clocks in an unrolled loop
-    int _calculateMathClocksInUnrolledLoop(Tensilelite::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, std::pair<double, double> bankConflicts)
+    int _calculateMathClocksInUnrolledLoop(origami::Formocast& formocast, std::shared_ptr<Module> module, int numWaves, std::pair<double, double> bankConflicts)
     {
         // Kernel: openLoop->loopBody->noLoadLoop
         int  cycles     = -1;
@@ -1177,20 +1177,20 @@ namespace rocisa
     // Main function to get cycles
     int getCycles(std::shared_ptr<Module> module, int numWaves)
     {
-        Tensilelite::Formocast formocast;
+        origami::Formocast formocast;
         auto isaVersion   = rocIsa::getInstance().getKernel().isaVersion;
         if (isaVersion == std::array<int, 3>{9, 5, 0}) {
-            formocast.setHardware(Tensilelite::HardwareArchitecture::gfx950);
+            formocast.setHardware(origami::hardware_t::architecture_t::gfx950);
         }
         else if (isaVersion == std::array<int, 3>{9, 4, 2}) {
-            formocast.setHardware(Tensilelite::HardwareArchitecture::gfx942);
+            formocast.setHardware(origami::hardware_t::architecture_t::gfx942);
         }
         else if (isaVersion == std::array<int, 3>{12, 0, 1}) {
-            formocast.setHardware(Tensilelite::HardwareArchitecture::gfx1201);
+            formocast.setHardware(origami::hardware_t::architecture_t::gfx1201);
         }
         else {
             // not supported
-            formocast.setHardware(Tensilelite::HardwareArchitecture::gfx950);
+            formocast.setHardware(origami::hardware_t::architecture_t::gfx950);
         }
         // Calculate local read bytes
         auto localReadBytes = _calculateLocalReadBytes(module, numWaves);
