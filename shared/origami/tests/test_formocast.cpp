@@ -698,7 +698,7 @@ TEST_CASE("Formocast: Occupancy resolution", "[formocast]") {
 
     auto hw = simulator.hw_consts;
 
-    SECTION("Occupancy comparison: occupancy=2 perf should be <= occupancy=1 perf") {
+    SECTION("check occupancy value") {
         // Calculate performance with occupancy = 1 (last parameter)
         double perf_occ1 = simulator.resolveOccupancy(hw, 100.0, 10.0, 50.0, 20.0, 2, 1, 1);
 

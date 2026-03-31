@@ -19,7 +19,7 @@ namespace origami
 
     double Formocast::calculateInitialCost(double num_tiles) const
     {
-        return hw_consts.initialCost * num_tiles + 1.7*(num_tiles-1); //VictorWu
+        return hw_consts.initialCost * num_tiles + 1.7*(num_tiles-1);
     }
 
     static double calculatePrefetchPerformance(int      pgr,
