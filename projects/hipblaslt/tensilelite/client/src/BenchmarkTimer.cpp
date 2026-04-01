@@ -102,6 +102,7 @@ namespace TensileLite
 
         void BenchmarkTimer::postProblem()
         {
+            //m_sleepPercent=100;
             m_currSolutionIdx = -1; // reset
             if(m_numSolutionSkip)
             {

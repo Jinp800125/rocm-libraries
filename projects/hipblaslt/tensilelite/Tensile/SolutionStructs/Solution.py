@@ -2871,14 +2871,14 @@ class Solution(collections.abc.Mapping):
         state["SuppressNoLoadLoop"] = False
         state["InternalSupportParams"]["SupportCustomStaggerU"] = False # Disable CustomStaggerU for TailloopInNll
 
-    # Determine if we can load directly-to-Vgpr
-    # need to check after state["LocalReadVectorWidth"] = -1 is resolved
-    if state["DirectToVgprA"]:
-      if not Solution.isDirectToVgprDoable(state, 'A', printRejectionReason, isaInfoMap):
-        return  # rejected
-    if state["DirectToVgprB"]:
-      if not Solution.isDirectToVgprDoable(state, 'B', printRejectionReason, isaInfoMap):
-        return  # rejected
+    # # Determine if we can load directly-to-Vgpr
+    # # need to check after state["LocalReadVectorWidth"] = -1 is resolved
+    # if state["DirectToVgprA"]:
+    #   if not Solution.isDirectToVgprDoable(state, 'A', printRejectionReason, isaInfoMap):
+    #     return  # rejected
+    # if state["DirectToVgprB"]:
+    #   if not Solution.isDirectToVgprDoable(state, 'B', printRejectionReason, isaInfoMap):
+    #     return  # rejected
 
     ########################################
     # LDS
@@ -3666,6 +3666,15 @@ class Solution(collections.abc.Mapping):
         state["PrefetchLocalRead"] = min(state["PrefetchLocalRead"], state["LoopIters"]-1)
         if state["LoopIters"] % (state["PrefetchLocalRead"]+1) != 0:
           reject(state, "dot2 kernel does not support LoopIters(%u) %% (PLR+1)(%u) != 0" % (state["LoopIters"], state["PrefetchLocalRead"]+1))
+
+    # Determine if we can load directly-to-Vgpr
+    # need to check after state["LocalReadVectorWidth"] = -1 is resolved
+    if state["DirectToVgprA"]:
+      if not Solution.isDirectToVgprDoable(state, 'A', printRejectionReason, isaInfoMap):
+        return  # rejected
+    if state["DirectToVgprB"]:
+      if not Solution.isDirectToVgprDoable(state, 'B', printRejectionReason, isaInfoMap):
+        return  # rejected
 
     # reject iterations are not enough to use wider local read
     if state["EnableMatrixInstruction"] and state["PrefetchLocalRead"] > 0:

@@ -56,6 +56,7 @@ namespace TensileLite
 
             virtual void preProblem(ContractionProblem* const problem) override;
             virtual void postProblem() override;
+            // virtual void STEP2resetProblem() override { /*m_sleepPercent=0;*/ }
 
             virtual void preSolution(ContractionSolution* const solution) override;
             virtual void postSolution() override;
