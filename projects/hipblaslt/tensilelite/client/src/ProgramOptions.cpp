@@ -127,6 +127,11 @@ namespace TensileLite
                        && options[i].value_semantic->has_explicit_default())
                     {
                         m_vm[canonical].value() = options[i].value_semantic->get_default();
+                        // Mark as defaulted so a later store() (e.g. from
+                        // parse_config_file) is allowed to overwrite this
+                        // CLI-default with the INI value. Boost-compatible
+                        // first-store-wins still protects explicit CLI values.
+                        m_vm[canonical].set_defaulted(true);
                     }
                 }
                 return m_vm;

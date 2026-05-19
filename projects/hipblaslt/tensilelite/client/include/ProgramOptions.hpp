@@ -86,6 +86,7 @@ namespace TensileLite
             class variable_value
             {
                 std::any m_value;
+                bool     m_defaulted = false;
 
             public:
                 variable_value() = default;
@@ -93,6 +94,20 @@ namespace TensileLite
                 bool empty() const
                 {
                     return !m_value.has_value();
+                }
+
+                // Match Boost: a value loaded via default_value() is "defaulted",
+                // explicit CLI / INI values are not. `store()` uses this to let
+                // a non-default source overwrite a default value (so INI can
+                // override CLI defaults), while still preventing later sources
+                // from overwriting an earlier non-default value.
+                bool defaulted() const
+                {
+                    return m_defaulted;
+                }
+                void set_defaulted(bool d)
+                {
+                    m_defaulted = d;
                 }
 
                 std::any& value()
@@ -597,10 +612,33 @@ namespace TensileLite
 
             variables_map parse_config_file(std::istream& is, options_description const& desc);
 
+            // Boost-compatible first-store-wins semantics: a previously stored
+            // non-default value is NOT overwritten by a later source. A value
+            // marked `defaulted` (e.g. filled by parse_command_line for an
+            // unspecified option) IS overwritten so that a config file can
+            // replace CLI defaults. The defaulted flag is propagated so a CLI
+            // default beaten by an INI value becomes non-defaulted.
+            // Order in callers should be:
+            //   po::store(po::parse_command_line(...), args);   // CLI first
+            //   po::store(po::parse_config_file(...),  args);   // INI second
+            // which yields CLI explicit > INI > CLI default.
+            //
+            // Restores the first-store-wins behavior Boost.program_options had
+            // before commit 5ebb51cc45 ("de-boost tensilelite: drop Boost.Program_options
+            // and Boost.Filesystem") replaced it with last-store-wins.
             inline void store(variables_map const& from, variables_map& to)
             {
                 for(auto const& kv : from)
-                    to[kv.first].value() = kv.second.value();
+                {
+                    auto it = to.find(kv.first);
+                    bool replace
+                        = (it == to.end()) || it->second.empty() || it->second.defaulted();
+                    if(replace)
+                    {
+                        to[kv.first].value() = kv.second.value();
+                        to[kv.first].set_defaulted(kv.second.defaulted());
+                    }
+                }
             }
 
             inline void notify(variables_map const&) {}

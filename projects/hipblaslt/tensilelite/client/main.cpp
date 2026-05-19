@@ -847,6 +847,11 @@ namespace TensileLite
 
         po::variables_map parse_args(int argc, const char* argv[])
         {
+            // `po` is TensileLite::Client::po, a custom in-house parser
+            // (see client/include/ProgramOptions.hpp) that mimics the
+            // boost::program_options API. Its `store()` is first-store-wins
+            // with default-aware promotion, so the order below gives the
+            // expected CLI explicit > INI > CLI default precedence.
             auto options = all_options();
 
             po::variables_map args;
