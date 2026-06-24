@@ -284,7 +284,7 @@ class GlobalWriteBatchWriter:
     matrixInstBM = 1 if (kernel["MatrixInstM"] == 4) else kernel["MatrixInstBM"]
     matrixInstBN = 1 if (kernel["MatrixInstN"] == 4) else kernel["MatrixInstBN"]
     OPM   = miM_ * miN_ // kernel["WavefrontSize"]
-    NEPBS = kernel["NumElementsPerBatchStore"]
+    NEPBS = kernel["NumElementsPerBatchStore"] if kernel["NumElementsPerBatchStore"] else numElementsPerBatch # max, do 'em all
 
     if outerTT1 > 1 and VW1 == 1:
       m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0 * VW1
