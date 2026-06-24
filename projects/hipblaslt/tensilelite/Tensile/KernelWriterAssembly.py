@@ -16000,7 +16000,11 @@ class KernelWriterAssembly(KernelWriter):
         # re-executed via the runtime loop.
         # For non-CLS, numBatchesCLS == numBatches so behaviour is unchanged.
         if kernel["CompactLoopStore"]:
-          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches)
+          # Pass numElementsPerBatch + gwvw so the emission limit uses the SAME
+          # divisibility guard as the per-instance iterCount/countdown; otherwise the
+          # body could be trimmed (numBatchesCLS<numBatches) while iterCount=1, leaving
+          # the trailing batches unstored.
+          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches, numElementsPerBatch, gwvw)
         else:
           numBatchesCLS = numBatches
 

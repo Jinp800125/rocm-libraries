@@ -249,7 +249,7 @@ class GlobalWriteBatchWriter:
     return SOrSaveExecB32 if self.wavelen == 32 else SOrSaveExecB64
 
   @staticmethod
-  def computeCLSLayout(kernel, numBatches: int):
+  def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False):
     """Single source of truth for the CLS loop layout math.
 
     Returns (batchesPerCLSBody, iterCount, m0Step), all derived from ONE shared
@@ -300,32 +300,54 @@ class GlobalWriteBatchWriter:
         m0Step = max(1, NEPBS // inner_dims)
         batchesPerBody = max(1, ceil(numBatches / NEPBS))
 
+    # Divisibility guard (non-SourceSwap): one store batch spans
+    # numElementsPerBatch * gwvw ValuC accumulator registers. If the total
+    # accumulator registers are NOT an exact multiple of that span, the batches are
+    # non-uniform (a partial trailing batch), so a single uniform M0 step cannot
+    # cover them -> looping over-reads / writes wrong rows. Disable compaction
+    # (iterCount=1) in that case; uniform layouts keep the branch-derived values.
+    if numElementsPerBatch and gwvw and not kernel["SourceSwap"]:
+      totalAccRegs = OPM * matrixInstBM * matrixInstBN * VW0 * VW1 * outerTT0 * outerTT1
+      regsPerBatch = numElementsPerBatch * gwvw
+      if regsPerBatch <= 0 or totalAccRegs % regsPerBatch != 0:
+        batchesPerBody = numBatches
+
     # StoreRemap / StreamK store paths are not covered by the CLS loop: force a
     # single iteration (body = all batches). m0Step is left as derived above to
     # preserve the original emitted SrdD step (it is dead when iterCount == 1).
     if kernel.get("StoreRemapVectorWidth", 0) != 0 or kernel.get("StreamK", 0) != 0:
       batchesPerBody = numBatches
 
+    # DEBUG narrowing: caller can force a single fully-unrolled iteration for a
+    # specific store variant (e.g. beta+edge) to isolate which CLS body is wrong.
+    if forceNoCompact:
+      batchesPerBody = numBatches
+
     iterCount = max(1, numBatches // batchesPerBody)
     return batchesPerBody, iterCount, m0Step
 
   @staticmethod
-  def computeBatchesPerCLSBody(kernel, numBatches: int) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches)[0]
+  def computeBatchesPerCLSBody(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None) -> int:
+    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)[0]
 
   def _computeBatchesPerCLSBody(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)[0]
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())[0]
+
+  def _clsForceNoCompact(self) -> bool:
+    # DEBUG: isolate beta+edge CLS bodies (e.g. label_CLS_1 / label_CLS_2) by
+    # forcing iterCount=1 for them only.
+    return bool(False)
 
   @staticmethod
-  def computeCLSIterCount(kernel, numBatches: int) -> int:
+  def computeCLSIterCount(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None) -> int:
     """CLS loop iter count = numBatches / batchesPerCLSBody. Minimum 1."""
-    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches)[1]
+    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)[1]
 
   def _computeCLSIterCount(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)[1]
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())[1]
 
   def _computeCLSLayout(self):
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())
 
   def emit(self) -> Module:
     assert self._checkAtomicPreconditions()
@@ -1674,6 +1696,7 @@ class GlobalWriteBatchWriter:
       packModule = Module("Empty pack module")
       convertModule = Module("Empty convert module")
       if self.needsAccumToDestConversion:
+        tmpInrSgpr = self._epilogScratchSgpr(1)
         if self.kernel["ActivationFuncCall"] and activationCDataType == self.kernel["ProblemType"]["DestDataType"]:
           destIdx = self.activationSetPCStruct.vgprActCopy
         else:
@@ -1686,21 +1709,21 @@ class GlobalWriteBatchWriter:
           # For UseSubtileImpl non-edge: paired dwordx4 path handles packing in _emit16bitSubtilePairedStore.
           if not is16bitSubtile:
             packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], bf16CVTVgprStruct=self.cvtVgprStruct,
-                                       tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+                                       tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         elif self.kernel["ProblemType"]["DestDataType"].isAnyFloat8():
           if self.kernel["ProblemType"]["StochasticRounding"]:
             packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], fp8CVTVgprStruct=self.cvtVgprStruct, \
-                                       tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, vgprTmp=vgprRND, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu, alphaScale=1.0)
+                                       tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, vgprTmp=vgprRND, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu, alphaScale=1.0)
           else:
             packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], fp8CVTVgprStruct=self.cvtVgprStruct, \
-                                       tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+                                       tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         elif self.kernel["ProblemType"]["DestDataType"].isAnyBFloat8():
           # TODO: BF8 stochastic rounding is not yet supported here.
           #       VCvtSRF32toBF8 instruction exists but stochasticRoundingCvt() only emits VCvtSRF32toFP8.
           #       To support BF8 SR: add SR branch here, generalize stochasticRoundingCvt() to accept bf8CVTVgprStruct,
           #       and select VCvtSRF32toBF8 based on DestDataType.
           packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], bf8CVTVgprStruct=self.cvtVgprStruct, \
-                                     tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+                                     tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         elif self.kernel["ProblemType"]["DestDataType"].isInt32():
           if self.kernel["ProblemType"]["ComputeDataType"].isSingle() and ((self.parentWriter.states.useBias == DataDirection.READ) or self.kernel["ActivationFuncCall"] or self.applyAlpha or self.beta):
             convertModule = convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_F32_to_I32, \
@@ -1709,8 +1732,9 @@ class GlobalWriteBatchWriter:
           if self.kernel["ProblemType"]["ComputeDataType"].isSingle() and ((self.parentWriter.states.useBias == DataDirection.READ) or self.kernel["ActivationFuncCall"] or self.applyAlpha or self.beta):
             convertModule = convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_F32_to_I32, roundType=RoundType.ROUND_TO_NEAREST_EVEN, \
                                         inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
-          packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.cvtVgprStruct, self.tmpS01,
+          packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.cvtVgprStruct, tmpInrSgpr,
                                      SaturateTypeInt8=SaturateTypeInt8, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+        self._epilogScratchFree(tmpInrSgpr)
 
       if self.parentWriter.states.asmCaps["HasWMMA_V1"] and self.kernel["EnableMatrixInstruction"] and self.kernel["ProblemType"]["DestDataType"].isHalf() and (not self.kernel["ProblemType"]["HighPrecisionAccumulate"]):
         for vi in range(0, self.gwvw):
