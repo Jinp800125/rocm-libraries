@@ -863,7 +863,7 @@ class AddrCalculation:
             module.add(SLShiftLeftB32(dst=sgpr(tmpSgpr), \
                                       src=sgpr(strideSgpr), \
                                       shiftHex=log2(bpe), \
-                                      comment="incToNextRow: Scale by BPE"))
+                                      comment="incrementSrdMultipleRows: Scale by BPE"))
         dstLow = f"{srcDstBaseSgpr}+0"
         dstHigh = f"{srcDstBaseSgpr}+1"
 
@@ -871,20 +871,20 @@ class AddrCalculation:
             module.add(SAddU32(dst=sgpr(dstLow), \
                                         src0=sgpr(dstLow), \
                                         src1=sgpr(tmpSgpr), \
-                                        comment="incToNextRow: gra SRD += inc(lower)" ))
+                                        comment="incrementSrdMultipleRows: gra SRD += inc(lower)" ))
             module.add(SAddCU32(dst=sgpr(dstHigh), \
                                         src0=sgpr(dstHigh), \
                                         src1=0, \
-                                        comment="incToNextRow: gra SRD += inc(upper)" ))
+                                        comment="incrementSrdMultipleRows: gra SRD += inc(upper)" ))
         else:
             module.add(SSubU32(dst=sgpr(dstLow), \
                                         src0=sgpr(dstLow), \
                                         src1=sgpr(tmpSgpr), \
-                                        comment="incToNextRow: gra SRD -= inc(lower)" ))
+                                        comment="incrementSrdMultipleRows: gra SRD -= inc(lower)" ))
             module.add(SSubBU32(dst=sgpr(dstHigh), \
                                         src0=sgpr(dstHigh), \
                                         src1=0, \
-                                        comment="incToNextRow: gra SRD -= inc(upper)" ))
+                                        comment="incrementSrdMultipleRows: gra SRD -= inc(upper)" ))
         return module
 
     def incrementToNextRow(self, kernel, tc, ss, stmp, forceinitrow0=0,
