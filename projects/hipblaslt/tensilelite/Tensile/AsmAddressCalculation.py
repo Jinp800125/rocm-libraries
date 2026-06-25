@@ -954,7 +954,7 @@ class AddrCalculation:
                         sc.add(SLShiftLeftB32(dst=sgpr(stmp), \
                                     src=sgpr(strideCD1), \
                                     shiftHex=log2(tmpBpe), \
-                                    comment="incToNextRow: Scale by BPE"))
+                                    comment="incToNextRow(%u): Scale by BPE"%(nr)))
                     return sc
 
                 # Legacy (non-CompactLoopStore): stride compute BEFORE s_add,
@@ -973,20 +973,20 @@ class AddrCalculation:
                     module.add(SAddU32(dst=sgpr(dstLow), \
                                         src0=sgpr(dstLow), \
                                         src1=sgpr(stmp), \
-                                        comment="incToNextRow: gra SRD += inc(lower)" ))
+                                        comment="incToNextRow(%u): gra SRD += inc(lower)"%(numRows) ))
                     module.add(SAddCU32(dst=sgpr(dstHigh), \
                                         src0=sgpr(dstHigh), \
                                         src1=0, \
-                                        comment="incToNextRow: gra SRD += inc(upper)" ))
+                                        comment="incToNextRow(%u): gra SRD += inc(upper)"%(numRows) ))
                 else: # numRows < 0
                     module.add(SSubU32(dst=sgpr(dstLow), \
                                         src0=sgpr(dstLow), \
                                         src1=sgpr(stmp), \
-                                        comment="incToNextRow: gra SRD -= inc(lower)" ))
+                                        comment="incToNextRow(%u): gra SRD -= inc(lower)"%(numRows) ))
                     module.add(SSubBU32(dst=sgpr(dstHigh), \
                                         src0=sgpr(dstHigh), \
                                         src1=0, \
-                                        comment="incToNextRow: gra SRD -= inc(upper)" ))
+                                        comment="incToNextRow(%u): gra SRD -= inc(upper)"%(numRows) ))
 
                 # CompactLoopStore: stride compute AFTER s_add (primes s[stmp]
                 # for the NEXT call's s_add). When caller passes
