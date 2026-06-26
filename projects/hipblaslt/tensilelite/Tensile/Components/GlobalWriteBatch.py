@@ -1884,9 +1884,11 @@ class GlobalWriteBatchWriter:
                                                   labelPrefix="subtile_skip_store")
           # Apply exec mask for partial M/N blocks (regular fp32 store path)
           if self.parentWriter.states.storeAlign8 and isSubtileNonEdge:
-            self._emitAlign8ExecMask(storeCodeModule, self.tmpS01, self.tmpS23, blockIdxM, blockIdxN,
+            tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
+            self._emitAlign8ExecMask(storeCodeModule, tmpInrSgpr, tmpInrSgpr+1**self.laneSGPRC, blockIdxM, blockIdxN,
                                      mGuardOffset=1, rowScaleShift=2)
-            storeCodeModule.add(self.getEdgeMovInstType()(EXEC(), sgpr(self.tmpS01, self.laneSGPRC), "apply exec mask"))
+            storeCodeModule.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpInrSgpr, self.laneSGPRC), "apply exec mask"))
+            self._epilogScratchFree(tmpInrSgpr)
           # _emitOverrideRows reused from the top of this store loop (see _lookaheadRowInc).
           tmpStoreCode = self.parentWriter.addStore(self.kernel, self.ss, 'D', addrCalc, sumIdx, self.tmpS01, self.edge, elementIdx, self.batchIdx,
                                                    overrideAfterPrimerRows=_emitOverrideRows, comment="store D")
@@ -2283,7 +2285,7 @@ class GlobalWriteBatchWriter:
     isGlc = bool(ntd & 0x1)
     isSlc = bool(ntd & 0x2)
     isNT  = bool(ntd & 0x4)
-
+    tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
     # Reuse cvtVgprStruct.vgprBf16Temp..vgprBf16Inc (+0..+3) as 4 scratch vgprs.
     # The cvtVgpr block is allocated with 2-alignment (64-bit aligned) in KWA so that
     # vgprBf16Temp is at an even VGPR index, satisfying buffer_store_dwordx4's
@@ -2347,13 +2349,13 @@ class GlobalWriteBatchWriter:
         module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(addrDVgpr), src1=vgpr(vLGDelta),
                            comment="adjusted D addr = addrDVgpr + lane_group*8"))
       if useAlign8:
-        self._emitAlign8ExecMask(module, self.tmpS01, self.tmpS23, blockIdxM, blockIdxN,
+        self._emitAlign8ExecMask(module, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
                                  mGuardOffset=2, rowScaleShift=1)
 
     module.add(self._emitSubtilePackedPermute(vPack, vPermAddr, addrWhilePermuting=emitAddrWhilePermuting))
 
     if useAlign8:
-      tmpS = self.tmpS01
+      tmpS = tmpInrSgpr
       module.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpS, self.laneSGPRC), "apply exec mask"))
 
     module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
@@ -2373,7 +2375,7 @@ class GlobalWriteBatchWriter:
     # The next paired store's v_cvt_pk_bf16_f32 will overwrite vPack.
     # Insert nop to ensure the store has latched its source VGPRs.
     module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
-
+    self._epilogScratchFree(tmpInrSgpr)
     return module
 
   def _emit16bitSubtileScalarStore(self, addrCalc, sumIdx0: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0) -> Module:
@@ -2413,7 +2415,7 @@ class GlobalWriteBatchWriter:
     isGlc = bool(ntd & 0x1)
     isSlc = bool(ntd & 0x2)
     isNT  = bool(ntd & 0x4)
-
+    tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
     # Scratch vgprs from the cvtVgprStruct block (overwritten each call):
     #   vPack+0  : 16bit packed dword (vc=0,1)
     #   vPack+1  : wave ID scratch / 16bit packed dword (vc=2,3)
@@ -2454,7 +2456,7 @@ class GlobalWriteBatchWriter:
     #         + waveId0*waveM_stride*bpe            [M-wave offset, if miwg0>1]
     #         + waveId1*waveN_stride*StrideD1J*bpe  [N-wave offset, if miwg1>1]
     # The SRD already encodes wg1*MT1*StrideD1J*bpe (N-WG offset).
-    tmpS = self.tmpS01
+    tmpS = tmpInrSgpr
     mt0bpe = self.kernel["MacroTile0"] * bpe
 
     module.addComment1("compute per-lane orphan vaddr = N_col_off + LG_M_off + wg0_M_off [+ wave offsets]")
@@ -2530,9 +2532,9 @@ class GlobalWriteBatchWriter:
 
     useAlign8 = self.parentWriter.states.storeAlign8
     if useAlign8:
-      self._emitAlign8ExecMask(module, self.tmpS01, self.tmpS23, blockIdxM, blockIdxN,
+      self._emitAlign8ExecMask(module, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
                                mGuardOffset=1, rowScaleShift=2)
-      module.add(self.getEdgeMovInstType()(EXEC(), sgpr(self.tmpS01, self.laneSGPRC), "apply exec mask"))
+      module.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpInrSgpr, self.laneSGPRC), "apply exec mask"))
 
     module.addComment1(f"buffer_store_b64: write 4 {typeStr} M-rows at fixed N-col (orphan subtile)")
     module.add(BufferStoreB64(
@@ -2546,7 +2548,7 @@ class GlobalWriteBatchWriter:
 
     if useAlign8:
       module.add(self.getEdgeMovInstType()(EXEC(), -1, "restore exec"))
-
+    self._epilogScratchFree(tmpInrSgpr)
     return module
 
   def _emitAtomicAdd(self, module: Module):
