@@ -9116,7 +9116,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if kernel["PreloadKernArgs"]:
       # kernel argument buffer address needs 2 sgprs
       # Workgroup ID x, y, z need 3 sgprs
-      self.states.numSgprPreload = self.states.archCaps["MaxSgprPreload"] - self.states.rpga - kernel["ProblemType"]["NumIndicesC"]
+      if 0:# isa != (12, 5, 0):
+        self.states.numSgprPreload = self.states.archCaps["MaxSgprPreload"] - self.states.rpga - kernel["ProblemType"]["NumIndicesC"]
+      else:
+        self.states.numSgprPreload = self.states.archCaps["MaxSgprPreload"] - self.states.rpga
 
       # Safe guard for preload arguments
       while(1):

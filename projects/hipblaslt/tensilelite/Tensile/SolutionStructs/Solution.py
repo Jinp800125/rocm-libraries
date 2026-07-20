@@ -2331,6 +2331,26 @@ class Solution(collections.abc.Mapping):
       elif state["ProblemType"]["MXBlockB"]:
         state["LocalReadVectorWidthMXS"] = state["MIInputPerThreadMXSB"]
 
+    # Reject MX solutions whose per-read MX-scale coverage is narrower than one
+    # scale sub-block (MatrixInstK/MXBlock). localReadMX computes
+    #   tilePerRead = (blockWidth*bpr) // (MatrixInstK/MXBlock)
+    # and then divides by it; when the scale local-read stride
+    # (lrvwUnrollMXS * VectorWidth * bpe) is smaller than MatrixInstK/MXBlock
+    # tilePerRead floors to 0 and codegen hits a divide-by-zero.
+    for tc, mxsChar in (("A", "MXSA"), ("B", "MXSB")):
+      if not state["ProblemType"]["MXBlock%s" % tc]:
+        continue
+      mxUnit = state["MatrixInstK"] // state["ProblemType"]["MXBlock%s" % tc]
+      lrvwUnrollMXS = state["LocalReadVectorWidthMXS"] if state["UnrollMajorLDS%s" % mxsChar] else 1
+      bpeMXS = state["ProblemType"]["DataType%s" % mxsChar].numBytes()
+      stridePerRead = lrvwUnrollMXS * state["VectorWidth%s" % tc] * bpeMXS
+      if stridePerRead < mxUnit:
+        reject(state, printRejectionReason,
+               "MX scale %s local-read stride (%d = lrvwUnrollMXS[%d] * VectorWidth%s[%d] * bpe[%d]) "
+               "is smaller than MatrixInstK/MXBlock%s (%d); localReadMX would divide by zero"
+               % (mxsChar, stridePerRead, lrvwUnrollMXS, tc, state["VectorWidth%s" % tc], bpeMXS, tc, mxUnit))
+        return
+
     # Some restrictions for half:
     if state["KernelLanguage"] == "Assembly" \
       and state["ProblemType"]["DataType"].isHalf():

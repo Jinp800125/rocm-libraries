@@ -1089,9 +1089,18 @@ class ProblemType(Mapping):
       self["IndexAssignmentsA"].append(2)
       self["IndexAssignmentsB"].append(2)
       self["IndexAssignmentsMetadata"].append(2)
-      self["NumIndicesC"] = 3
+      # isa = tuple(self["ISA"])
+      if 1:# isa != (12, 5, 0):
+        self["NumIndicesC"] = 3
+      else:
+        self["NumIndicesC"] = 0
     else:
-      self["NumIndicesC"] = 2
+      # isa = tuple(self["ISA"])
+      if 1:# isa != (12, 5, 0):
+        self["NumIndicesC"] = 2
+      else:
+        self["NumIndicesC"] = 0
+      
 
     self["NumIndicesLD"] = 4
     self["IndexAssignmentsLD"][0] = self["NumIndicesC"] + 1
