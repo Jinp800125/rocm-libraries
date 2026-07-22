@@ -147,34 +147,16 @@ class SignatureDefault(Signature):
 
         if writer.debugConfig.debugKernel:
             signature.addArg("AddressDbg", SVK.SIG_GLOBALBUFFER, "struct", "generic")
-        signature.addArg("D", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
-        signature.addArg("C", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
+
+        # A/B input buffers
         signature.addArg("A", SVK.SIG_GLOBALBUFFER, srcValueTypeA, "generic")
         if kernel["ProblemType"]["MXBlockA"]:
             signature.addArg("MXSA", SVK.SIG_GLOBALBUFFER, "void", "generic")
         signature.addArg("B", SVK.SIG_GLOBALBUFFER, srcValueTypeB, "generic")
         if kernel["ProblemType"]["MXBlockB"]:
             signature.addArg("MXSB", SVK.SIG_GLOBALBUFFER, "void", "generic")
-        userArgumentsInfo.gemmArgumentSize += (8 + 8 + 8 + 8)  # A, B, C, D buffer
-        if kernel["ProblemType"]["MXBlockA"]:
-            userArgumentsInfo.gemmArgumentSize += 8
-        if kernel["ProblemType"]["MXBlockB"]:
-            userArgumentsInfo.gemmArgumentSize += 8
-        if kernel["ProblemType"]["Sparse"]:
-            signature.addArg("MetaData", SVK.SIG_GLOBALBUFFER, "void" , "generic")
 
-        if kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0:
-            signature.addArg("AddressWS", SVK.SIG_GLOBALBUFFER, cptValueType, "generic")
-            signature.addArg("AddressFlags", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
-
-        for i in range(0, writer.states.d.numSgprStrides):
-            signature.addArg(              "strideD%u"%i, SVK.SIG_VALUE,               "u32")
-            userArgumentsInfo.gemmArgumentSize += 4
-
-        for i in range(0, writer.states.c.numSgprStrides):
-            signature.addArg(              "strideC%u"%i, SVK.SIG_VALUE,               "u32")
-            userArgumentsInfo.gemmArgumentSize += 4
-
+        # A/B strides
         for i in range(0, writer.states.a.numSgprStrides):
             signature.addArg(              "strideA%u"%i, SVK.SIG_VALUE,               "u32")
             userArgumentsInfo.gemmArgumentSize += 4
@@ -196,6 +178,33 @@ class SignatureDefault(Signature):
         if kernel["ProblemType"]["Sparse"]:
             for i in range(0, writer.states.m.numSgprStrides):
                 signature.addArg(   "strideMetadata%u"%i, SVK.SIG_VALUE,               "u32")
+
+        # metadata buffer
+        if kernel["ProblemType"]["Sparse"]:
+            signature.addArg("MetaData", SVK.SIG_GLOBALBUFFER, "void" , "generic")
+
+        # StreamK workspace + flags
+        if kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0:
+            signature.addArg("AddressWS", SVK.SIG_GLOBALBUFFER, cptValueType, "generic")
+            signature.addArg("AddressFlags", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
+
+        # D/C output buffers
+        signature.addArg("D", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
+        signature.addArg("C", SVK.SIG_GLOBALBUFFER, dstValueType, "generic")
+        userArgumentsInfo.gemmArgumentSize += (8 + 8 + 8 + 8)  # A, B, C, D buffer
+        if kernel["ProblemType"]["MXBlockA"]:
+            userArgumentsInfo.gemmArgumentSize += 8
+        if kernel["ProblemType"]["MXBlockB"]:
+            userArgumentsInfo.gemmArgumentSize += 8
+
+        # C/D strides
+        for i in range(0, writer.states.d.numSgprStrides):
+            signature.addArg(              "strideD%u"%i, SVK.SIG_VALUE,               "u32")
+            userArgumentsInfo.gemmArgumentSize += 4
+
+        for i in range(0, writer.states.c.numSgprStrides):
+            signature.addArg(              "strideC%u"%i, SVK.SIG_VALUE,               "u32")
+            userArgumentsInfo.gemmArgumentSize += 4
 
         for idxChar in kernel["PackedC0IdxChars"][:-1]:
             signature.addArg("MagicNumberSize%s"%idxChar, SVK.SIG_VALUE,               "u32")

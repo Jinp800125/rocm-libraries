@@ -579,6 +579,72 @@ namespace TensileLite
                 idx++;
             }
         }
+
+        if(problemType.stridedBatched)
+        {
+            args.template append<void const*>(
+                "a", problemType.sparse == 1 ? inputs.compressed : inputs.a);
+            if(problemType.mxBlockA)
+                args.template append<void const*>("mxsa", inputs.mxsa);
+            args.template append<void const*>(
+                "b", problemType.sparse == 2 ? inputs.compressed : inputs.b);
+            if(problemType.mxBlockB)
+                args.template append<void const*>("mxsb", inputs.mxsb);
+        }
+        else
+        {
+            args.template append<void const* const*>("batchA", inputs.batchA);
+            args.template append<void const* const*>("batchB", inputs.batchB);
+        }
+
+        size_t startStrideAB = problemType.useInitialStridesAB ? 0 : 1;
+        
+        for(size_t i = startStrideAB; i < a.dimensions(); i++)
+        {
+            auto stride_a = problemType.sparse == 1 ? compressed.strides()[i] : a.strides()[i];
+            args.template append<uint32_t>(concatenate_if<T_Debug>("strideA", i), stride_a);
+        }
+
+        if(problemType.mxBlockA)
+            for(size_t i = startStrideAB; i < mxsa.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMXSA", i), mxsa.strides()[i]);
+
+        for(size_t i = startStrideAB; i < b.dimensions(); i++)
+        {
+            auto stride_b = problemType.sparse == 2 ? compressed.strides()[i] : b.strides()[i];
+            args.template append<uint32_t>(concatenate_if<T_Debug>("strideB", i), stride_b);
+        }
+
+        if(problemType.mxBlockB)
+            for(size_t i = startStrideAB; i < mxsb.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMXSB", i), mxsb.strides()[i]);
+
+        if(problemType.sparse)
+        {
+            for(size_t i = startStrideAB; i < a.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMetadata", i),
+                                               metadata.strides()[i]);
+        }
+
+        if(problemType.sparse)
+            args.template append<unsigned char const*>("metadata", inputs.metadata);
+
+        // Additional check for General Batched GEMM until GSU and StreamK are supported
+        // in General Batched GEMM
+        if(sizeMapping.streamK > 0 && sizeMapping.streamKAtomic == 0)
+        {
+            // Assert hardware is not null
+            // For now grouped gemm is not supported and passes nullptr
+            TENSILE_ASSERT_EXC(hardware != nullptr);
+
+            // StreamK workspace + flags
+            args.template append<void const*>("ws", inputs.ws);
+            if(sk.reduction == origami::reduction_t::parallel)
+                args.template append<void*>("Flags", nullptr);
+            else
+                args.template append<void*>("Flags", inputs.Synchronizer);
+        }
+
         bool singleWSD = false;
         if(sizeMapping.globalAccumulation == 1
            && (problemType.computeType != problemType.dType
@@ -622,44 +688,7 @@ namespace TensileLite
             args.template append<void const* const*>("batchC", inputs.batchC);
         }
 
-        if(problemType.stridedBatched)
-        {
-            args.template append<void const*>(
-                "a", problemType.sparse == 1 ? inputs.compressed : inputs.a);
-            if(problemType.mxBlockA)
-                args.template append<void const*>("mxsa", inputs.mxsa);
-            args.template append<void const*>(
-                "b", problemType.sparse == 2 ? inputs.compressed : inputs.b);
-            if(problemType.mxBlockB)
-                args.template append<void const*>("mxsb", inputs.mxsb);
-        }
-        else
-        {
-            args.template append<void const* const*>("batchA", inputs.batchA);
-            args.template append<void const* const*>("batchB", inputs.batchB);
-        }
-
-        if(problemType.sparse)
-            args.template append<unsigned char const*>("metadata", inputs.metadata);
-
-        // Additional check for General Batched GEMM until GSU and StreamK are supported
-        // in General Batched GEMM
-        if(sizeMapping.streamK > 0 && sizeMapping.streamKAtomic == 0)
-        {
-            // Assert hardware is not null
-            // For now grouped gemm is not supported and passes nullptr
-            TENSILE_ASSERT_EXC(hardware != nullptr);
-
-            // StreamK workspace + flags
-            args.template append<void const*>("ws", inputs.ws);
-            if(sk.reduction == origami::reduction_t::parallel)
-                args.template append<void*>("Flags", nullptr);
-            else
-                args.template append<void*>("Flags", inputs.Synchronizer);
-        }
-
         size_t startStrideCD = problemType.useInitialStridesCD ? 0 : 1;
-        size_t startStrideAB = problemType.useInitialStridesAB ? 0 : 1;
 
         // Pass wsStride if it's not in MBSK mode
         bool gsuWSStride
@@ -692,33 +721,6 @@ namespace TensileLite
             for(size_t i = startStrideCD; i < c.dimensions(); i++)
                 args.template append<uint32_t>(concatenate_if<T_Debug>("strideC", i),
                                                c.strides()[i]);
-        }
-
-        for(size_t i = startStrideAB; i < a.dimensions(); i++)
-        {
-            auto stride_a = problemType.sparse == 1 ? compressed.strides()[i] : a.strides()[i];
-            args.template append<uint32_t>(concatenate_if<T_Debug>("strideA", i), stride_a);
-        }
-
-        if(problemType.mxBlockA)
-            for(size_t i = startStrideAB; i < mxsa.dimensions(); i++)
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMXSA", i), mxsa.strides()[i]);
-
-        for(size_t i = startStrideAB; i < b.dimensions(); i++)
-        {
-            auto stride_b = problemType.sparse == 2 ? compressed.strides()[i] : b.strides()[i];
-            args.template append<uint32_t>(concatenate_if<T_Debug>("strideB", i), stride_b);
-        }
-
-        if(problemType.mxBlockB)
-            for(size_t i = startStrideAB; i < mxsb.dimensions(); i++)
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMXSB", i), mxsb.strides()[i]);
-
-        if(problemType.sparse)
-        {
-            for(size_t i = startStrideAB; i < a.dimensions(); i++)
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMetadata", i),
-                                               metadata.strides()[i]);
         }
 
         args.append("alpha", inputs.alpha, problem.alphaType());

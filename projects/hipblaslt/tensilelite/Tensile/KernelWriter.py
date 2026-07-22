@@ -9145,24 +9145,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
         break
       SgprSlot.append(tempSgpr)
     self.defineSgpr("SizesSum", self.states.numSgprSizesSum)
-    self.defineSgpr("AddressD", numSgprAddressD)
-    self.defineSgpr("AddressC", numSgprAddressC)
+    # A/B input buffers
     self.defineSgpr("AddressA", numSgprAddressA)
     if kernel["ProblemType"]["MXBlockA"]:
       self.defineSgpr("AddressMXSA", numSgprAddressMXSA)
     self.defineSgpr("AddressB", numSgprAddressB)
     if kernel["ProblemType"]["MXBlockB"]:
       self.defineSgpr("AddressMXSB", numSgprAddressMXSB)
-    if kernel["ProblemType"]["Sparse"]:
-      self.defineSgpr("AddressMetadata", numSgprAddressMetadata)
-    if kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0:
-      self.defineSgpr("AddressWS", numSgprAddressWS)
-      self.defineSgpr("AddressFlags", numSgprAddressFlags)
-      self.states.numSgprStreamK += numSgprAddressWS + numSgprAddressFlags
 
     #asm input interface depen
-    self.defineSgpr("StridesD", self.states.d.numSgprStrides)
-    self.defineSgpr("StridesC", self.states.c.numSgprStrides)
+    # A/B strides
     self.defineSgpr("StridesA", self.states.a.numSgprStrides)
     if kernel["ProblemType"]["MXBlockA"]:
       self.defineSgpr("StridesMXSA", self.states.mxsa.numSgprStrides)
@@ -9171,6 +9163,24 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("StridesMXSB", self.states.mxsb.numSgprStrides)
     if kernel["ProblemType"]["Sparse"]:
       self.defineSgpr("StridesMetadata", self.states.m.numSgprStrides)
+
+    # metadata buffer
+    if kernel["ProblemType"]["Sparse"]:
+      self.defineSgpr("AddressMetadata", numSgprAddressMetadata)
+
+    # StreamK workspace + flags
+    if kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0:
+      self.defineSgpr("AddressWS", numSgprAddressWS)
+      self.defineSgpr("AddressFlags", numSgprAddressFlags)
+      self.states.numSgprStreamK += numSgprAddressWS + numSgprAddressFlags
+
+    # D/C output buffers
+    self.defineSgpr("AddressD", numSgprAddressD)
+    self.defineSgpr("AddressC", numSgprAddressC)
+
+    # C/D strides
+    self.defineSgpr("StridesD", self.states.d.numSgprStrides)
+    self.defineSgpr("StridesC", self.states.c.numSgprStrides)
 
     # for packed batches without stride restrictions need to do something different here
     assert sorted(kernel["PackedC0IdxChars"]+kernel["PackedC1IdxChars"]) == \
