@@ -52,7 +52,7 @@ from ..Components.PackData import formatting, PackData_F16, PackData_BF16, PackD
 from rocisa.instruction import ECvtF16toF32, ECvtPkFP8toF32, ECvtPkBF8toF32
 from ..KernelWriterModules import hasSequentialValuC, accToArchMapper, getAccToArchLen
 
-from math import ceil, log2
+from math import ceil, log2, gcd
 
 
 def _scmpGtU32(writer, src, imm, comment=""):
@@ -252,106 +252,123 @@ class GlobalWriteBatchWriter:
   def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False):
     """Single source of truth for the CLS loop layout math.
 
-    Returns (batchesPerCLSBody, iterCount, m0Step), all derived from ONE shared
-    read of the MI output layout so the loop trip count and the M0 src stride
-    can never drift apart:
-      - batchesPerCLSBody: how many batches one CLS loop body covers. The body
-        must align to the SrdD-advance period, else the loop would run s_add
-        SrdD too many times.
-      - iterCount: numBatches / batchesPerCLSBody (>= 1).
-      - m0Step: stride of the CLS iter dim in the v_movrelsd_2_b32 src formula
-        (added to M0 each iteration).
-    Which dim is the CLS iter dim depends on the output layout:
-      (a) outerTT1  > 1, VW1 == 1            : iter = wgIdx1, step = OPM*BM*BN*VW0*outerTT0*VW1
-      (b) outerTT1 == 1, VW1 > 1, SS=False   : iter = vw1,    step = OPM*BM*BN*VW0*outerTT0
-      (c) outerTT1 == 1, VW1 == 1, SS=True   : iter = tIdx,   step = NEPBS / inner_dims
-    Store paths not covered by the CLS loop (non-MI, StoreRemap, StreamK) and
-    non-divisible / non-regular layouts fall back to a single iteration
-    (batchesPerCLSBody = numBatches), where m0Step is dead.
+    Returns (batchesPerCLSBody, iterCount, m0Step).
+
+    Two independent constraints must both hold for a valid CLS loop:
+
+    (A) DST/address side -- the loop can only iterate the free1/N (d1) direction.
+        Each iteration advances the store SRD by one row via incToNextRow
+        (SrdD += StrideD1J). The M-side tiles (outerTT0 / vw0) are emitted as
+        immediate store offsets INSIDE one body, so the loop CANNOT step them.
+        Hence iterCount must divide the number of free1/N wave-tile rows
+        `maxNIter = MIWaveTile[1] * matrixInstBN`. This is a C-memory property and
+        holds for SourceSwap too (SS only reshuffles which MI register feeds each
+        output position, handled by arch2acc in (B), not the memory layout). When
+        maxNIter == 1 there is no N row to step over -> single iteration. (This is
+        why an M-only layout such as MIWaveTile=[6,1] must NOT loop: its "batches"
+        step M via immediate offsets, and looping incToNextRow would write the
+        wrong rows.)
+
+    (B) SRC side -- m0Step is read straight from the acc->arch permutation the
+        store emits (accToArchMapper). A store batch is a contiguous slice of
+        `regsPerBatch = totalLen / numBatches` arch slots; for a candidate
+        iterCount the body is `bodyLen = totalLen / iterCount` arch slots and the
+        per-body src shift must be CONSTANT (arch2acc[d+bodyLen]-arch2acc[d]).
+
+    We take the largest iterCount that divides gcd(maxNIter, numBatches) (so it
+    is a whole-N-row grouping AND splits the batches evenly) and whose (B) shift
+    is uniform. Otherwise a single fully-unrolled iteration (m0Step dead).
+    StoreRemap / StreamK store paths and forceNoCompact also force iterCount = 1.
     """
-    batchesPerBody = numBatches
     m0Step = 1
     if not kernel["EnableMatrixInstruction"]:
-      return batchesPerBody, 1, m0Step
+      return numBatches, 1, m0Step
 
-    VW0 = kernel["VectorWidthA"]
+    # Store paths not covered by the CLS loop, or explicit debug override: no loop.
+    if forceNoCompact or kernel.get("StoreRemapVectorWidth", 0) != 0 or kernel.get("StreamK", 0) != 0:
+      return numBatches, 1, m0Step
+
+    if numBatches <= 1:
+      return numBatches, 1, m0Step
+
+    # (A) The CLS loop advances the store address only along free1/N via
+    # incToNextRow, and it can compact only the OUTERMOST N tile dimension whose
+    # inter-body stride is uniform. Inner N positions have the fine per-column
+    # (+StrideC1J) stride and are UNROLLED inside one body; the outer tile
+    # boundary uses a single bigger stride that repeats uniformly per iteration.
+    # So maxNIter = the outermost N dimension with count > 1, walking outer->inner:
+    #   non-SourceSwap: wgIdx1(outerTT1) -> bIdx1(matrixInstBN) -> vw1(VW1)
+    #                   (OPM lands on M here, as immediate store offsets)
+    #   SourceSwap:     wgIdx1(outerTT1) -> bIdx1(matrixInstBN) -> tIdx(OPM) -> vw1(VW1)
+    #                   (SS transposes the MI output so OPM lands on N)
+    # Using the outermost >1 dim (not the product MIWaveTile[1]) prevents looping
+    # across a non-uniform group boundary (e.g. MIWaveTile=[1,16] VW1=8: 16 N
+    # columns split into outerTT1=2 groups of 8; only the 2 groups have a uniform
+    # inter-body stride, so iterCount must be 2, not 16).
     VW1 = kernel["VectorWidthB"]
-    outerTT0 = kernel["MIWaveTile"][0] // VW0
     outerTT1 = kernel["MIWaveTile"][1] // VW1
-    miT  = min(kernel["MatrixInstM"], kernel["MatrixInstN"])
-    miM_ = (kernel["MatrixInstM"] * kernel["MatrixInstBM"]) if (kernel["MatrixInstM"] == 4) else miT
-    miN_ = (kernel["MatrixInstN"] * kernel["MatrixInstBN"]) if (kernel["MatrixInstN"] == 4) else miT
-    matrixInstBM = 1 if (kernel["MatrixInstM"] == 4) else kernel["MatrixInstBM"]
     matrixInstBN = 1 if (kernel["MatrixInstN"] == 4) else kernel["MatrixInstBN"]
-    OPM   = miM_ * miN_ // kernel["WavefrontSize"]
-    NEPBS = kernel["NumElementsPerBatchStore"] if kernel["NumElementsPerBatchStore"] else numElementsPerBatch # max, do 'em all
+    if kernel["SourceSwap"]:
+      miT  = min(kernel["MatrixInstM"], kernel["MatrixInstN"])
+      miM_ = (kernel["MatrixInstM"] * kernel["MatrixInstBM"]) if (kernel["MatrixInstM"] == 4) else miT
+      miN_ = (kernel["MatrixInstN"] * kernel["MatrixInstBN"]) if (kernel["MatrixInstN"] == 4) else miT
+      OPM  = miM_ * miN_ // kernel["WavefrontSize"]
+      nDimsOuterToInner = [outerTT1, matrixInstBN, OPM, VW1]
+    else:
+      nDimsOuterToInner = [outerTT1, matrixInstBN, VW1]
+    maxNIter = 1
+    for _d in nDimsOuterToInner:
+      if _d > 1:
+        maxNIter = _d
+        break
+    if maxNIter <= 1:
+      return numBatches, 1, m0Step
 
-    # if outerTT1 > 1 and VW1 == 1: #412
-    if outerTT1 > 1: # and VW1 == 1: #256
-      m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0 * VW1
-      if 1: #numBatches % outerTT1 == 0:
-        batchesPerBody = max(1, numBatches // outerTT1)
-    elif outerTT1 == 1 and VW1 > 1: # and not kernel["SourceSwap"]:
-      m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0
-      if 1: #numBatches % VW1 == 0:
-        batchesPerBody = max(1, numBatches // VW1)
-    elif outerTT1 == 1 and VW1 == 1 and kernel["SourceSwap"]:
-      inner_dims = VW0 * outerTT0 * matrixInstBM * matrixInstBN
-      if 1: #NEPBS % inner_dims == 0:
-        m0Step = max(1, NEPBS // inner_dims)
-        batchesPerBody = max(1, ceil(numBatches / NEPBS))
+    totalLen = getAccToArchLen(kernel)
+    if totalLen <= 0 or totalLen % numBatches != 0:
+      return numBatches, 1, m0Step
 
-    # Divisibility guard (non-SourceSwap): one store batch spans
-    # numElementsPerBatch * gwvw ValuC accumulator registers. If the total
-    # accumulator registers are NOT an exact multiple of that span, the batches are
-    # non-uniform (a partial trailing batch), so a single uniform M0 step cannot
-    # cover them -> looping over-reads / writes wrong rows. Disable compaction
-    # (iterCount=1) in that case; uniform layouts keep the branch-derived values.
-    if numElementsPerBatch and gwvw: # and not kernel["SourceSwap"]:
-      totalAccRegs = OPM * matrixInstBM * matrixInstBN * VW0 * VW1 * outerTT0 * outerTT1
-      regsPerBatch = numElementsPerBatch * gwvw
-      if regsPerBatch <= 0 or totalAccRegs % regsPerBatch != 0:
-        batchesPerBody = numBatches
+    MIRPO = kernel["MIRegPerOut"]
 
-    # StoreRemap / StreamK store paths are not covered by the CLS loop: force a
-    # single iteration (body = all batches). m0Step is left as derived above to
-    # preserve the original emitted SrdD step (it is dead when iterCount == 1).
-    if kernel.get("StoreRemapVectorWidth", 0) != 0 or kernel.get("StreamK", 0) != 0:
-      batchesPerBody = numBatches
+    # Batches must ALL be equal size for one reused body to cover them. A store
+    # batch spans numElementsPerBatch*gwvw VGPRs; when numElementsPerBatch (the
+    # VGPR-limited max) does not divide the total elements, the store emits a
+    # smaller trailing batch (e.g. 8 elements -> 6 + 2) and the loop body would
+    # over/under-run. Require (a) the total VGPRs split evenly into regsPerBatch
+    # and (b) the implied batch count match numBatches. This is also robust to
+    # numElementsPerBatch being the *current* batch's length: for an uneven split
+    # the full batch (#0) fails (a) and the short batch fails (b), so every
+    # batchIdx agrees on "no loop".
+    if not numElementsPerBatch or not gwvw:
+      return numBatches, 1, m0Step
+    regsPerBatch = numElementsPerBatch * gwvw
+    totalVgpr = totalLen * MIRPO
+    if regsPerBatch <= 0 or totalVgpr % regsPerBatch != 0 or totalVgpr // regsPerBatch != numBatches:
+      return numBatches, 1, m0Step
 
-    # DEBUG narrowing: caller can force a single fully-unrolled iteration for a
-    # specific store variant (e.g. beta+edge) to isolate which CLS body is wrong.
-    if forceNoCompact:
-      batchesPerBody = numBatches
+    _, arch2acc = accToArchMapper(kernel)
 
-    iterCount = max(1, numBatches // batchesPerBody)
+    def _uniformStep(iterCount):
+      if totalLen % iterCount != 0:
+        return None
+      bodyLen = totalLen // iterCount
+      step = arch2acc[bodyLen] - arch2acc[0]
+      if all(arch2acc[d + bodyLen] - arch2acc[d] == step for d in range(totalLen - bodyLen)):
+        return step
+      return None
 
-    # M0 step for v_movrelsd_2_b32: the CLS loop reuses ONE "copy MI out reg"
-    # body per iteration and offsets the SRC VGPR index by M0. The body covers
-    # the first bodyLen = totalLen/iterCount slots of the acc->arch permutation,
-    # and the next body must land on the following slice, so the step is exactly
-    # arch2acc[bodyLen] - arch2acc[0] (scaled by MIRegPerOut, since each acc slot
-    # spans that many VGPRs). Reading it from the same mapping the store emits
-    # makes it correct for SourceSwap and non-SourceSwap alike and impossible to
-    # drift from the emitted src indices. CLS also requires this shift to be
-    # UNIFORM across the whole body; if it is not, the layout is non-regular so
-    # fall back to a single (fully unrolled) iteration.
-    if iterCount > 1:
-      _, arch2acc = accToArchMapper(kernel)
-      totalLen = getAccToArchLen(kernel)
-      if totalLen % iterCount == 0:
-        bodyLen = totalLen // iterCount
-        step = arch2acc[bodyLen] - arch2acc[0]
-        if all(arch2acc[d + bodyLen] - arch2acc[d] == step for d in range(totalLen - bodyLen)):
-          m0Step = step * kernel["MIRegPerOut"]
-        else:
-          batchesPerBody, iterCount = numBatches, 1
-      else:
-        batchesPerBody, iterCount = numBatches, 1
+    # iterCount must be a whole-N-row grouping (divides maxNIter) and split the
+    # batches evenly (divides numBatches). Largest such with a uniform src shift
+    # wins (most compaction).
+    g = gcd(maxNIter, numBatches)
+    for iterCount in range(g, 1, -1):
+      if g % iterCount != 0:
+        continue
+      step = _uniformStep(iterCount)
+      if step is not None:
+        return numBatches // iterCount, iterCount, step * MIRPO
 
-    # m0Step = int(m0Step/batchesPerBody)
-
-    return batchesPerBody, iterCount, m0Step
+    return numBatches, 1, m0Step
 
   @staticmethod
   def computeBatchesPerCLSBody(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None) -> int:

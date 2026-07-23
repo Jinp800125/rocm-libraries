@@ -15721,6 +15721,8 @@ class KernelWriterAssembly(KernelWriter):
       # where a smaller batch reduces register pressure or improves store pipelining).
       numElementsPerBatch = len(element)
 
+    # print("numElementsPerBatch: ", numElementsPerBatch, numVgprAvailable, ss.numVgprsPerElement)
+
     # Cap batch size to align on MIWaveTile[0] (M-tile) boundaries.
     # The acc-to-VGPR mapping interleaves M and N tiles, so a batch that
     # partially covers an N-column still touches the full acc range of that
