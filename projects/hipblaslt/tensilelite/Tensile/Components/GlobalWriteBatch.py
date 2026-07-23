@@ -50,7 +50,7 @@ from ..AsmStoreState import StoreState
 from ..AsmAddressCalculation import AddrCalculation
 from ..Components.PackData import formatting, PackData_F16, PackData_BF16, PackData_FLOAT8, PackData_FLOAT8_fnuz
 from rocisa.instruction import ECvtF16toF32, ECvtPkFP8toF32, ECvtPkBF8toF32
-from ..KernelWriterModules import hasSequentialValuC
+from ..KernelWriterModules import hasSequentialValuC, accToArchMapper, getAccToArchLen
 
 from math import ceil, log2
 
@@ -286,17 +286,18 @@ class GlobalWriteBatchWriter:
     OPM   = miM_ * miN_ // kernel["WavefrontSize"]
     NEPBS = kernel["NumElementsPerBatchStore"] if kernel["NumElementsPerBatchStore"] else numElementsPerBatch # max, do 'em all
 
-    if outerTT1 > 1 and VW1 == 1:
+    # if outerTT1 > 1 and VW1 == 1: #412
+    if outerTT1 > 1: # and VW1 == 1: #256
       m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0 * VW1
-      if numBatches % outerTT1 == 0:
+      if 1: #numBatches % outerTT1 == 0:
         batchesPerBody = max(1, numBatches // outerTT1)
-    elif outerTT1 == 1 and VW1 > 1 and not kernel["SourceSwap"]:
+    elif outerTT1 == 1 and VW1 > 1: # and not kernel["SourceSwap"]:
       m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0
-      if numBatches % VW1 == 0:
+      if 1: #numBatches % VW1 == 0:
         batchesPerBody = max(1, numBatches // VW1)
     elif outerTT1 == 1 and VW1 == 1 and kernel["SourceSwap"]:
       inner_dims = VW0 * outerTT0 * matrixInstBM * matrixInstBN
-      if NEPBS % inner_dims == 0:
+      if 1: #NEPBS % inner_dims == 0:
         m0Step = max(1, NEPBS // inner_dims)
         batchesPerBody = max(1, ceil(numBatches / NEPBS))
 
@@ -306,7 +307,7 @@ class GlobalWriteBatchWriter:
     # non-uniform (a partial trailing batch), so a single uniform M0 step cannot
     # cover them -> looping over-reads / writes wrong rows. Disable compaction
     # (iterCount=1) in that case; uniform layouts keep the branch-derived values.
-    if numElementsPerBatch and gwvw and not kernel["SourceSwap"]:
+    if numElementsPerBatch and gwvw: # and not kernel["SourceSwap"]:
       totalAccRegs = OPM * matrixInstBM * matrixInstBN * VW0 * VW1 * outerTT0 * outerTT1
       regsPerBatch = numElementsPerBatch * gwvw
       if regsPerBatch <= 0 or totalAccRegs % regsPerBatch != 0:
@@ -324,6 +325,32 @@ class GlobalWriteBatchWriter:
       batchesPerBody = numBatches
 
     iterCount = max(1, numBatches // batchesPerBody)
+
+    # M0 step for v_movrelsd_2_b32: the CLS loop reuses ONE "copy MI out reg"
+    # body per iteration and offsets the SRC VGPR index by M0. The body covers
+    # the first bodyLen = totalLen/iterCount slots of the acc->arch permutation,
+    # and the next body must land on the following slice, so the step is exactly
+    # arch2acc[bodyLen] - arch2acc[0] (scaled by MIRegPerOut, since each acc slot
+    # spans that many VGPRs). Reading it from the same mapping the store emits
+    # makes it correct for SourceSwap and non-SourceSwap alike and impossible to
+    # drift from the emitted src indices. CLS also requires this shift to be
+    # UNIFORM across the whole body; if it is not, the layout is non-regular so
+    # fall back to a single (fully unrolled) iteration.
+    if iterCount > 1:
+      _, arch2acc = accToArchMapper(kernel)
+      totalLen = getAccToArchLen(kernel)
+      if totalLen % iterCount == 0:
+        bodyLen = totalLen // iterCount
+        step = arch2acc[bodyLen] - arch2acc[0]
+        if all(arch2acc[d + bodyLen] - arch2acc[d] == step for d in range(totalLen - bodyLen)):
+          m0Step = step * kernel["MIRegPerOut"]
+        else:
+          batchesPerBody, iterCount = numBatches, 1
+      else:
+        batchesPerBody, iterCount = numBatches, 1
+
+    # m0Step = int(m0Step/batchesPerBody)
+
     return batchesPerBody, iterCount, m0Step
 
   @staticmethod
@@ -861,6 +888,9 @@ class GlobalWriteBatchWriter:
 
       module.add(SMovB32(dst=sgpr("CLSm0Base"), src=hex(0x0), comment="CLS M0 base = 0"))
       module.add(SMovB32(dst=sgpr("CLSLoopCounter"), src=hex(self._computeCLSIterCount()), comment="CLS loop iter count"))
+      module.addComment0("batchnum=%u" % self.numBatches)
+      module.addComment0("len(self.batchElements)=%u" % len(self.batchElements))
+      module.addComment0("totalAccRegs=%u" % getAccToArchLen(self.kernel))
       module.addComment2(commentStr)
       self.ss._clsLoopLabel = Label(self.parentWriter.labels.getNameInc("CLS"), "")
       module.add(self.ss._clsLoopLabel)
