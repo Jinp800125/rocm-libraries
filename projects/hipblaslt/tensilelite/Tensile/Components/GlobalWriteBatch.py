@@ -249,7 +249,7 @@ class GlobalWriteBatchWriter:
     return SOrSaveExecB32 if self.wavelen == 32 else SOrSaveExecB64
 
   @staticmethod
-  def computeCLSLayout(kernel, numBatches: int):
+  def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False):
     """Single source of truth for the CLS loop layout math.
 
     Returns (batchesPerCLSBody, iterCount, m0Step), all derived from ONE shared
@@ -284,7 +284,7 @@ class GlobalWriteBatchWriter:
     matrixInstBM = 1 if (kernel["MatrixInstM"] == 4) else kernel["MatrixInstBM"]
     matrixInstBN = 1 if (kernel["MatrixInstN"] == 4) else kernel["MatrixInstBN"]
     OPM   = miM_ * miN_ // kernel["WavefrontSize"]
-    NEPBS = kernel["NumElementsPerBatchStore"]
+    NEPBS = kernel["NumElementsPerBatchStore"] if kernel["NumElementsPerBatchStore"] else numElementsPerBatch # max, do 'em all
 
     if outerTT1 > 1 and VW1 == 1:
       m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0 * VW1
@@ -300,32 +300,54 @@ class GlobalWriteBatchWriter:
         m0Step = max(1, NEPBS // inner_dims)
         batchesPerBody = max(1, ceil(numBatches / NEPBS))
 
+    # Divisibility guard (non-SourceSwap): one store batch spans
+    # numElementsPerBatch * gwvw ValuC accumulator registers. If the total
+    # accumulator registers are NOT an exact multiple of that span, the batches are
+    # non-uniform (a partial trailing batch), so a single uniform M0 step cannot
+    # cover them -> looping over-reads / writes wrong rows. Disable compaction
+    # (iterCount=1) in that case; uniform layouts keep the branch-derived values.
+    if numElementsPerBatch and gwvw and not kernel["SourceSwap"]:
+      totalAccRegs = OPM * matrixInstBM * matrixInstBN * VW0 * VW1 * outerTT0 * outerTT1
+      regsPerBatch = numElementsPerBatch * gwvw
+      if regsPerBatch <= 0 or totalAccRegs % regsPerBatch != 0:
+        batchesPerBody = numBatches
+
     # StoreRemap / StreamK store paths are not covered by the CLS loop: force a
     # single iteration (body = all batches). m0Step is left as derived above to
     # preserve the original emitted SrdD step (it is dead when iterCount == 1).
     if kernel.get("StoreRemapVectorWidth", 0) != 0 or kernel.get("StreamK", 0) != 0:
       batchesPerBody = numBatches
 
+    # DEBUG narrowing: caller can force a single fully-unrolled iteration for a
+    # specific store variant (e.g. beta+edge) to isolate which CLS body is wrong.
+    if forceNoCompact:
+      batchesPerBody = numBatches
+
     iterCount = max(1, numBatches // batchesPerBody)
     return batchesPerBody, iterCount, m0Step
 
   @staticmethod
-  def computeBatchesPerCLSBody(kernel, numBatches: int) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches)[0]
+  def computeBatchesPerCLSBody(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None) -> int:
+    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)[0]
 
   def _computeBatchesPerCLSBody(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)[0]
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())[0]
+
+  def _clsForceNoCompact(self) -> bool:
+    # DEBUG: isolate beta+edge CLS bodies (e.g. label_CLS_1 / label_CLS_2) by
+    # forcing iterCount=1 for them only.
+    return bool(False)
 
   @staticmethod
-  def computeCLSIterCount(kernel, numBatches: int) -> int:
+  def computeCLSIterCount(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None) -> int:
     """CLS loop iter count = numBatches / batchesPerCLSBody. Minimum 1."""
-    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches)[1]
+    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)[1]
 
   def _computeCLSIterCount(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)[1]
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())[1]
 
   def _computeCLSLayout(self):
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())
 
   def emit(self) -> Module:
     assert self._checkAtomicPreconditions()
@@ -1678,6 +1700,8 @@ class GlobalWriteBatchWriter:
       packModule = Module("Empty pack module")
       convertModule = Module("Empty convert module")
       if self.needsAccumToDestConversion:
+        # CLS: pack via a scratch sgpr, not tmpS01, so it can't clobber the row-inc primer chain.
+        tmpInrSgpr = self._epilogScratchSgpr(1)
         if self.kernel["ActivationFuncCall"] and activationCDataType == self.kernel["ProblemType"]["DestDataType"]:
           destIdx = self.activationSetPCStruct.vgprActCopy
         else:
@@ -1690,21 +1714,21 @@ class GlobalWriteBatchWriter:
           # For UseSubtileImpl non-edge: paired dwordx4 path handles packing in _emit16bitSubtilePairedStore.
           if not is16bitSubtile:
             packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], bf16CVTVgprStruct=self.cvtVgprStruct,
-                                       tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+                                       tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         elif self.kernel["ProblemType"]["DestDataType"].isAnyFloat8():
           if self.kernel["ProblemType"]["StochasticRounding"]:
             packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], fp8CVTVgprStruct=self.cvtVgprStruct, \
-                                       tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, vgprTmp=vgprRND, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu, alphaScale=1.0)
+                                       tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, vgprTmp=vgprRND, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu, alphaScale=1.0)
           else:
             packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], fp8CVTVgprStruct=self.cvtVgprStruct, \
-                                       tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+                                       tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         elif self.kernel["ProblemType"]["DestDataType"].isAnyBFloat8():
           # TODO: BF8 stochastic rounding is not yet supported here.
           #       VCvtSRF32toBF8 instruction exists but stochasticRoundingCvt() only emits VCvtSRF32toFP8.
           #       To support BF8 SR: add SR branch here, generalize stochasticRoundingCvt() to accept bf8CVTVgprStruct,
           #       and select VCvtSRF32toBF8 based on DestDataType.
           packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], bf8CVTVgprStruct=self.cvtVgprStruct, \
-                                     tmpS01=self.tmpS01, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+                                     tmpS01=tmpInrSgpr, laneSGPRC=self.laneSGPRC, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         elif self.kernel["ProblemType"]["DestDataType"].isInt32():
           if self.kernel["ProblemType"]["ComputeDataType"].isSingle() and ((self.parentWriter.states.useBias == DataDirection.READ) or self.kernel["ActivationFuncCall"] or self.applyAlpha or self.beta):
             convertModule = convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_F32_to_I32, \
@@ -1713,8 +1737,9 @@ class GlobalWriteBatchWriter:
           if self.kernel["ProblemType"]["ComputeDataType"].isSingle() and ((self.parentWriter.states.useBias == DataDirection.READ) or self.kernel["ActivationFuncCall"] or self.applyAlpha or self.beta):
             convertModule = convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_F32_to_I32, roundType=RoundType.ROUND_TO_NEAREST_EVEN, \
                                         inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
-          packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.cvtVgprStruct, self.tmpS01,
+          packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.cvtVgprStruct, tmpInrSgpr,
                                      SaturateTypeInt8=SaturateTypeInt8, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
+        self._epilogScratchFree(tmpInrSgpr)
 
       if self.parentWriter.states.asmCaps["HasWMMA_V1"] and self.kernel["EnableMatrixInstruction"] and self.kernel["ProblemType"]["DestDataType"].isHalf() and (not self.kernel["ProblemType"]["HighPrecisionAccumulate"]):
         for vi in range(0, self.gwvw):
@@ -1848,7 +1873,8 @@ class GlobalWriteBatchWriter:
                 storeCodeModule.add(orphanSkipLabel)
               self.storesIssued += 1
         elif self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel":#GSUGSU
-          tmpStoreCode = self.parentWriter.addStore(self.kernel, self.ss, 'TD', addrCalc, sumIdx, self.tmpS01, self.edge, comment="store TD not StoreRemapVectorWidth")
+          tmpStoreCode = self.parentWriter.addStore(self.kernel, self.ss, 'TD', addrCalc, sumIdx, self.tmpS01, self.edge, elementIdx, self.batchIdx,
+                                                   overrideAfterPrimerRows=_emitOverrideRows, comment="store TD not StoreRemapVectorWidth")
           storeCodeModule.add(tmpStoreCode)
           self.storesIssued += 1
         else:
@@ -1863,9 +1889,11 @@ class GlobalWriteBatchWriter:
                                                   labelPrefix="subtile_skip_store")
           # Apply exec mask for partial M/N blocks (regular fp32 store path)
           if self.parentWriter.states.storeAlign8 and isSubtileNonEdge:
-            self._emitAlign8ExecMask(storeCodeModule, self.tmpS01, self.tmpS23, blockIdxM, blockIdxN,
+            tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
+            self._emitAlign8ExecMask(storeCodeModule, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
                                      mGuardOffset=1, rowScaleShift=2)
-            storeCodeModule.add(self.getEdgeMovInstType()(EXEC(), sgpr(self.tmpS01, self.laneSGPRC), "apply exec mask"))
+            storeCodeModule.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpInrSgpr, self.laneSGPRC), "apply exec mask"))
+            self._epilogScratchFree(tmpInrSgpr)
           # _emitOverrideRows reused from the top of this store loop (see _lookaheadRowInc).
           tmpStoreCode = self.parentWriter.addStore(self.kernel, self.ss, 'D', addrCalc, sumIdx, self.tmpS01, self.edge, elementIdx, self.batchIdx,
                                                    overrideAfterPrimerRows=_emitOverrideRows, comment="store D")
@@ -2262,7 +2290,7 @@ class GlobalWriteBatchWriter:
     isGlc = bool(ntd & 0x1)
     isSlc = bool(ntd & 0x2)
     isNT  = bool(ntd & 0x4)
-
+    tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
     # Reuse cvtVgprStruct.vgprBf16Temp..vgprBf16Inc (+0..+3) as 4 scratch vgprs.
     # The cvtVgpr block is allocated with 2-alignment (64-bit aligned) in KWA so that
     # vgprBf16Temp is at an even VGPR index, satisfying buffer_store_dwordx4's
@@ -2326,13 +2354,13 @@ class GlobalWriteBatchWriter:
         module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(addrDVgpr), src1=vgpr(vLGDelta),
                            comment="adjusted D addr = addrDVgpr + lane_group*8"))
       if useAlign8:
-        self._emitAlign8ExecMask(module, self.tmpS01, self.tmpS23, blockIdxM, blockIdxN,
+        self._emitAlign8ExecMask(module, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
                                  mGuardOffset=2, rowScaleShift=1)
 
     module.add(self._emitSubtilePackedPermute(vPack, vPermAddr, addrWhilePermuting=emitAddrWhilePermuting))
 
     if useAlign8:
-      tmpS = self.tmpS01
+      tmpS = tmpInrSgpr
       module.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpS, self.laneSGPRC), "apply exec mask"))
 
     module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
@@ -2352,7 +2380,7 @@ class GlobalWriteBatchWriter:
     # The next paired store's v_cvt_pk_bf16_f32 will overwrite vPack.
     # Insert nop to ensure the store has latched its source VGPRs.
     module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
-
+    self._epilogScratchFree(tmpInrSgpr)
     return module
 
   def _emit16bitSubtileScalarStore(self, addrCalc, sumIdx0: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0) -> Module:
@@ -2392,7 +2420,7 @@ class GlobalWriteBatchWriter:
     isGlc = bool(ntd & 0x1)
     isSlc = bool(ntd & 0x2)
     isNT  = bool(ntd & 0x4)
-
+    tmpInrSgpr = self._epilogScratchSgpr(2*self.laneSGPRC)
     # Scratch vgprs from the cvtVgprStruct block (overwritten each call):
     #   vPack+0  : 16bit packed dword (vc=0,1)
     #   vPack+1  : wave ID scratch / 16bit packed dword (vc=2,3)
@@ -2433,7 +2461,7 @@ class GlobalWriteBatchWriter:
     #         + waveId0*waveM_stride*bpe            [M-wave offset, if miwg0>1]
     #         + waveId1*waveN_stride*StrideD1J*bpe  [N-wave offset, if miwg1>1]
     # The SRD already encodes wg1*MT1*StrideD1J*bpe (N-WG offset).
-    tmpS = self.tmpS01
+    tmpS = tmpInrSgpr
     mt0bpe = self.kernel["MacroTile0"] * bpe
 
     module.addComment1("compute per-lane orphan vaddr = N_col_off + LG_M_off + wg0_M_off [+ wave offsets]")
@@ -2509,9 +2537,9 @@ class GlobalWriteBatchWriter:
 
     useAlign8 = self.parentWriter.states.storeAlign8
     if useAlign8:
-      self._emitAlign8ExecMask(module, self.tmpS01, self.tmpS23, blockIdxM, blockIdxN,
+      self._emitAlign8ExecMask(module, tmpInrSgpr, tmpInrSgpr+1*self.laneSGPRC, blockIdxM, blockIdxN,
                                mGuardOffset=1, rowScaleShift=2)
-      module.add(self.getEdgeMovInstType()(EXEC(), sgpr(self.tmpS01, self.laneSGPRC), "apply exec mask"))
+      module.add(self.getEdgeMovInstType()(EXEC(), sgpr(tmpInrSgpr, self.laneSGPRC), "apply exec mask"))
 
     module.addComment1(f"buffer_store_b64: write 4 {typeStr} M-rows at fixed N-col (orphan subtile)")
     module.add(BufferStoreB64(
@@ -2525,7 +2553,7 @@ class GlobalWriteBatchWriter:
 
     if useAlign8:
       module.add(self.getEdgeMovInstType()(EXEC(), -1, "restore exec"))
-
+    self._epilogScratchFree(tmpInrSgpr)
     return module
 
   def _emitAtomicAdd(self, module: Module):

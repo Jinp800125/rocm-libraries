@@ -16000,7 +16000,11 @@ class KernelWriterAssembly(KernelWriter):
         # re-executed via the runtime loop.
         # For non-CLS, numBatchesCLS == numBatches so behaviour is unchanged.
         if kernel["CompactLoopStore"]:
-          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches)
+          # Pass numElementsPerBatch + gwvw so the emission limit uses the SAME
+          # divisibility guard as the per-instance iterCount/countdown; otherwise the
+          # body could be trimmed (numBatchesCLS<numBatches) while iterCount=1, leaving
+          # the trailing batches unstored.
+          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches, numElementsPerBatch, gwvw)
         else:
           numBatchesCLS = numBatches
 
@@ -16010,7 +16014,20 @@ class KernelWriterAssembly(KernelWriter):
         # scan in GlobalWriteBatchWriter falls through to this value when no
         # further intra-batch emit is found (= last emitting elt of the batch
         # needs the cross-batch advance). 0 for non-CLS / last batch / atomic.
+        # Two distinct per-batch look-ahead values (see consumers below):
+        #   next_rowInc_per_batch : coord1 delta exactly AT the batch boundary
+        #     (this batch's last elt -> next batch's first elt). Drives the
+        #     coord1/rowPtr look-ahead (direct_next_rowInc) emitted at batch end.
+        #     When the boundary splits a row group (next batch starts mid-row)
+        #     this is 0, so no spurious advance is emitted at the boundary.
+        #   next_firing_per_batch : the next REAL row crossing at/after the
+        #     boundary (first non-zero consecutive coord1 delta). Drives the
+        #     SrdC/D delayed-primer fall-through (inter_iter_rowInc) -- the value
+        #     the next batch's first incrementToNextRow will consume. Scans past
+        #     leading same-row columns so a row-splitting boundary still primes
+        #     the true jump (e.g. 49) instead of a stale 1.
         next_rowInc_per_batch = [0] * numBatches
+        next_firing_per_batch = [0] * numBatches
         if kernel["CompactLoopStore"] and not atomic:
           # Use the single authoritative coordOffset1 formula in
           # getStoreElementsInfoForBatch (returns coord1 per element for the
@@ -16020,6 +16037,11 @@ class KernelWriterAssembly(KernelWriter):
             _elStopIdx = min((_bIdx + 1) * numElementsPerBatch, len(element))
             if _elStopIdx < len(element):
               next_rowInc_per_batch[_bIdx] = _coord1All[_elStopIdx] - _coord1All[_elStopIdx - 1]
+              for _j in range(_elStopIdx, len(element)):
+                _d = _coord1All[_j] - _coord1All[_j - 1]
+                if _d != 0:
+                  next_firing_per_batch[_bIdx] = _d
+                  break
 
         for batchIdx in range(0, numBatchesCLS):
           elementStartIdx = batchIdx * numElementsPerBatch
@@ -16033,17 +16055,14 @@ class KernelWriterAssembly(KernelWriter):
             #Indication if this batch is last batch for this column block shape
             self.StoreRemapLastBatch = 1 if (batchIdx+1) % nBatchesPerRow == 0 else 0
 
-          # Look ahead through next_rowInc_per_batch for the first non-zero
-          # transition: SRVW path skips batches whose `addrCalc.rowInc == 0`,
-          # so the chain primer at the current batch primes for the NEXT
-          # firing consumer (= first batch with a real row transition).
-          # Cumulative skip is implicit since skipped transitions are 0 and
-          # contribute nothing to the sum.
-          _next_firing_rowInc = 0
-          for _k in range(batchIdx, numBatches):
-            if next_rowInc_per_batch[_k] != 0:
-              _next_firing_rowInc = next_rowInc_per_batch[_k]
-              break
+          # inter_iter_rowInc = the next real row crossing at/after this batch's
+          # boundary (precomputed element-wise above). This already skips leading
+          # same-row columns AND zero-transition (SRVW) batches, so it primes the
+          # delayed-primer chain for the actual next firing consumer.
+          _next_firing_rowInc = next_firing_per_batch[batchIdx]
+          # direct_next_rowInc = the boundary delta (0 if the next batch starts
+          # mid-row), so the coord1/rowPtr look-ahead emits an advance at the
+          # batch boundary only when the row actually changes there.
           _direct_next_rowInc = next_rowInc_per_batch[batchIdx] if batchIdx < numBatches else 0
           actLoopModule.add(self.globalWriteBatch(kernel, tPA, tPB, activation, ss, batchIdx, \
               applyAlpha, beta, edge, atomic, gwvw, atomicW, \
@@ -16528,8 +16547,12 @@ class KernelWriterAssembly(KernelWriter):
         else:
           addr0 = vgpr(addrCalc.addrGSUSyncVgprs,2)
           addr1 = ""
-        if ss.optSrdIncForRow and addrCalc.rowInc:
-          module.add(addrCalc.incrementToNextRow(kernel, "TD", ss, tmpS01))
+        module.add(TextBlock("\n/* ss.optSrdIncForRow (%s) addrCalc.rowInc (%s) -> elementIdx (%s) batchIdx (%s)*/\n"%(ss.optSrdIncForRow, addrCalc.rowInc, elementIdx, batchIdx)))
+        # CLS: the first store (elt0/batch0) must prime the initial row even when
+        # rowInc==0, so the reused loop body starts from a known SrdTD row base.
+        if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and elementIdx == 0 and batchIdx == 0))):
+          module.add(addrCalc.incrementToNextRow(kernel, "TD", ss, tmpS01, forceinitrow0=1,
+                                                 overrideAfterPrimerRows=overrideAfterPrimerRows))
         dataType     = kernel["ProblemType"]["DestDataType"]
         globalOffset = addrCalc.globalOffset
         globalOffset = int((globalOffset/self.states.bpeCexternal) * self.states.bpr * kernel["ProblemType"]["DestDataType"].numRegisters())

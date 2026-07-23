@@ -22,7 +22,7 @@
 
 from rocisa import countInstruction
 from rocisa.code import Module, Label, RegSet, ValueSet
-from rocisa.container import ContinuousRegister, EXEC, SMEMModifiers, MUBUFModifiers, FLATModifiers, vgpr, sgpr, replaceHolder
+from rocisa.container import ContinuousRegister, EXEC, SMEMModifiers, MUBUFModifiers, FLATModifiers, vgpr, sgpr, mgpr, replaceHolder
 from rocisa.enum import CacheScope
 from rocisa.instruction import SAddCU32, SAddU32, SAndB32, SLoadB32, SStoreB32, SBranch, \
     SCBranchSCC0, SCBranchSCC1, SCMovB32, SCSelectB32, SCmpEQU32, SCmpLgU32, SCmpLtU32, SCmpGtI32, \
@@ -1182,6 +1182,10 @@ class GSUOn(GSU):
         module.addComment0("optSingleColVgpr=%u optSharedColVgpr=%u optSGPRUsage=%s optSrdIncForRow=%u" % \
             (ss.optSingleColVgpr, ss.optSharedColVgpr, ss.optSGPRUsage, ss.optSrdIncForRow))
 
+        if kernel.get("CompactLoopStore", False):
+                module.add(SMovB32(dst=mgpr(0), src=0,
+                    comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
+
         if kernel["StoreSyncOpt"]:
             module.add(SSleep(kernel["StoreSyncOpt"] - 1, "optimization: sync and wait"))
             module.add(SBarrier())
@@ -1561,6 +1565,7 @@ class GSUOn(GSU):
         # the SCOPE_DEV partial-write store + flat_atomic_dec_u32 ordering.
         gsuReadScope = CacheScope.SCOPE_DEV \
             if writer.states.archCaps["DefaultScopeIsCULocal"] else CacheScope.SCOPE_NONE
+
 
         if batchIdx == 0:
             # wait for write to ws and do atomic dec to synchronizer
@@ -2001,6 +2006,9 @@ class GSUOn(GSU):
 
         accvgprReadLabel = Label(writer.labels.getNameInc("last_gsu_wg_accvgpr_read"), comment="")
         module.add(accvgprReadLabel)
+        if kernel.get("CompactLoopStore", False):
+                module.add(SMovB32(dst=mgpr(0), src=0,
+                    comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
         module.add(SWaitCnt(vlcnt=0, comment="wait for buffer_load to finish"))
 
         tmpVAdd = tmpVgprDynamic.idx

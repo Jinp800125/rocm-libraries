@@ -226,7 +226,7 @@ globalParameters["CMakeCXXFlags"] = ""  # pass flags to cmake
 globalParameters["CMakeCFlags"] = ""  # pass flags to cmake
 globalParameters["AsanBuild"] = False  # build with asan
 #globalParameters["SaveTemps"] = False  # Generate intermediate results of hip kernels
-globalParameters["KeepBuildTmp"] = False  # If true, do not remove artifacts in build_tmp
+globalParameters["KeepBuildTmp"] = True  # If true, do not remove artifacts in build_tmp
 
 # debug for assembly
 #globalParameters["SplitGSU"] = False  # Split GSU kernel into GSU1 and GSUM
@@ -487,7 +487,7 @@ defaultBenchmarkCommonParameters = [
     {"OptNoLoadLoop": [1]},
     {"BufferLoad": [True]},
     {"BufferStore": [True]},
-    {"CompactLoopStore": [False]},
+    {"CompactLoopStore": [True]},
     {"DirectToVgprA": [False]},
     {"DirectToVgprB": [False]},
     {"DirectToVgprMXSA": [False]},

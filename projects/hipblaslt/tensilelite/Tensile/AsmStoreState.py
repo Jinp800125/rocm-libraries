@@ -83,7 +83,9 @@ class StoreState:
             if ss.optSGPRUsage == 'BufferLoad_Mask':
                 self.numMaskSgprPerElement = 0
                 self.numMaskSgprPerBatch   = 0
-                self.numTempSgprPerBatch = (2 if getattr(kernelWriter.states, 'storeAlign8', False) else 1) * kernelWriter.states.laneSGPRCount
+                # align8/CLS partial-store paths need a 2nd lane-mask slot: the exec
+                # mask must live off tmpS01 so it can't clobber the row-inc primer chain.
+                self.numTempSgprPerBatch = (2 if getattr(kernelWriter.states, 'storeAlign8', False) or kernel["CompactLoopStore"] else 1) * kernelWriter.states.laneSGPRCount
             elif ss.optSGPRUsage == 'BufferLoad_Edge_Mask':
                 self.numMaskSgprPerElement = 0
                 self.numMaskSgprPerBatch   = kernelWriter.states.laneSGPRCount
