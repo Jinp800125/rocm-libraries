@@ -249,6 +249,44 @@ class GlobalWriteBatchWriter:
     return SOrSaveExecB32 if self.wavelen == 32 else SOrSaveExecB64
 
   @staticmethod
+  def clsMaxNIter(kernel) -> int:
+    """Max number of CLS loop iterations = the OUTERMOST free1/N tile dimension
+    with count > 1.
+
+    The CLS loop advances the store address only along free1/N via incToNextRow,
+    and it can compact only the outermost N tile dimension whose inter-body stride
+    is uniform. Inner N positions have the fine per-column (+StrideC1J) stride and
+    are UNROLLED inside one body; the outer tile boundary uses a single bigger
+    stride that repeats uniformly per iteration. Walking outer->inner:
+      non-SourceSwap: wgIdx1(outerTT1) -> bIdx1(matrixInstBN) -> vw1(VW1)
+                      (OPM lands on M here, as immediate store offsets)
+      SourceSwap:     wgIdx1(outerTT1) -> bIdx1(matrixInstBN) -> tIdx(OPM) -> vw1(VW1)
+                      (SS transposes the MI output so OPM lands on N)
+    Using the outermost >1 dim (not the product MIWaveTile[1]) prevents looping
+    across a non-uniform group boundary (e.g. MIWaveTile=[1,16] VW1=8: 16 N columns
+    split into outerTT1=2 groups of 8; only the 2 groups have a uniform inter-body
+    stride, so iterCount must be 2, not 16). Returns 1 when there is no N tile to
+    step over (M-only layout).
+    """
+    if not kernel["EnableMatrixInstruction"]:
+      return 1
+    VW1 = kernel["VectorWidthB"]
+    outerTT1 = kernel["MIWaveTile"][1] // VW1
+    matrixInstBN = 1 if (kernel["MatrixInstN"] == 4) else kernel["MatrixInstBN"]
+    if kernel["SourceSwap"]:
+      miT  = min(kernel["MatrixInstM"], kernel["MatrixInstN"])
+      miM_ = (kernel["MatrixInstM"] * kernel["MatrixInstBM"]) if (kernel["MatrixInstM"] == 4) else miT
+      miN_ = (kernel["MatrixInstN"] * kernel["MatrixInstBN"]) if (kernel["MatrixInstN"] == 4) else miT
+      OPM  = miM_ * miN_ // kernel["WavefrontSize"]
+      nDimsOuterToInner = [outerTT1, matrixInstBN, OPM, VW1]
+    else:
+      nDimsOuterToInner = [outerTT1, matrixInstBN, VW1]
+    for _d in nDimsOuterToInner:
+      if _d > 1:
+        return _d
+    return 1
+
+  @staticmethod
   def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False):
     """Single source of truth for the CLS loop layout math.
 
@@ -260,14 +298,11 @@ class GlobalWriteBatchWriter:
         Each iteration advances the store SRD by one row via incToNextRow
         (SrdD += StrideD1J). The M-side tiles (outerTT0 / vw0) are emitted as
         immediate store offsets INSIDE one body, so the loop CANNOT step them.
-        Hence iterCount must divide the number of free1/N wave-tile rows
-        `maxNIter = MIWaveTile[1] * matrixInstBN`. This is a C-memory property and
-        holds for SourceSwap too (SS only reshuffles which MI register feeds each
-        output position, handled by arch2acc in (B), not the memory layout). When
-        maxNIter == 1 there is no N row to step over -> single iteration. (This is
-        why an M-only layout such as MIWaveTile=[6,1] must NOT loop: its "batches"
-        step M via immediate offsets, and looping incToNextRow would write the
-        wrong rows.)
+        Hence iterCount must divide `maxNIter = clsMaxNIter(kernel)`, the OUTERMOST
+        free1/N tile dimension with count > 1 (see clsMaxNIter). When maxNIter == 1
+        there is no N row to step over -> single iteration. (This is why an M-only
+        layout such as MIWaveTile=[6,1] must NOT loop: its "batches" step M via
+        immediate offsets, and looping incToNextRow would write the wrong rows.)
 
     (B) SRC side -- m0Step is read straight from the acc->arch permutation the
         store emits (accToArchMapper). A store batch is a contiguous slice of
@@ -291,36 +326,9 @@ class GlobalWriteBatchWriter:
     if numBatches <= 1:
       return numBatches, 1, m0Step
 
-    # (A) The CLS loop advances the store address only along free1/N via
-    # incToNextRow, and it can compact only the OUTERMOST N tile dimension whose
-    # inter-body stride is uniform. Inner N positions have the fine per-column
-    # (+StrideC1J) stride and are UNROLLED inside one body; the outer tile
-    # boundary uses a single bigger stride that repeats uniformly per iteration.
-    # So maxNIter = the outermost N dimension with count > 1, walking outer->inner:
-    #   non-SourceSwap: wgIdx1(outerTT1) -> bIdx1(matrixInstBN) -> vw1(VW1)
-    #                   (OPM lands on M here, as immediate store offsets)
-    #   SourceSwap:     wgIdx1(outerTT1) -> bIdx1(matrixInstBN) -> tIdx(OPM) -> vw1(VW1)
-    #                   (SS transposes the MI output so OPM lands on N)
-    # Using the outermost >1 dim (not the product MIWaveTile[1]) prevents looping
-    # across a non-uniform group boundary (e.g. MIWaveTile=[1,16] VW1=8: 16 N
-    # columns split into outerTT1=2 groups of 8; only the 2 groups have a uniform
-    # inter-body stride, so iterCount must be 2, not 16).
-    VW1 = kernel["VectorWidthB"]
-    outerTT1 = kernel["MIWaveTile"][1] // VW1
-    matrixInstBN = 1 if (kernel["MatrixInstN"] == 4) else kernel["MatrixInstBN"]
-    if kernel["SourceSwap"]:
-      miT  = min(kernel["MatrixInstM"], kernel["MatrixInstN"])
-      miM_ = (kernel["MatrixInstM"] * kernel["MatrixInstBM"]) if (kernel["MatrixInstM"] == 4) else miT
-      miN_ = (kernel["MatrixInstN"] * kernel["MatrixInstBN"]) if (kernel["MatrixInstN"] == 4) else miT
-      OPM  = miM_ * miN_ // kernel["WavefrontSize"]
-      nDimsOuterToInner = [outerTT1, matrixInstBN, OPM, VW1]
-    else:
-      nDimsOuterToInner = [outerTT1, matrixInstBN, VW1]
-    maxNIter = 1
-    for _d in nDimsOuterToInner:
-      if _d > 1:
-        maxNIter = _d
-        break
+    # (A) The CLS loop can compact only the OUTERMOST N tile dimension (see
+    # clsMaxNIter). If there is none (maxNIter == 1) there is nothing to loop.
+    maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
     if maxNIter <= 1:
       return numBatches, 1, m0Step
 
@@ -908,6 +916,13 @@ class GlobalWriteBatchWriter:
       module.addComment0("batchnum=%u" % self.numBatches)
       module.addComment0("len(self.batchElements)=%u" % len(self.batchElements))
       module.addComment0("totalAccRegs=%u" % getAccToArchLen(self.kernel))
+      # DEBUG: which cap bounds numElementsPerBatch (VGPR vs SGPR vs NEPBS)?
+      #   vgprAllowedNEPB = numVgprAvailable // numVgprsPerElement
+      module.addComment0("clsdbg vgprAllowedNEPB=%s sgprLimNEPB=%s NEPBS=%s numVgprsPerElement=%s gwvw=%u (vgprAllowedNEPB = numVgprAvailable // numVgprsPerElement)" % (
+          str(getattr(self.ss.cfg, "dbgVgprAllowedNEPB", "?")),
+          str(getattr(self.ss.cfg, "numElementsPerBatchLimitedBySgprs", "?")),
+          str(self.kernel["NumElementsPerBatchStore"]),
+          str(self.ss.numVgprsPerElement), self.gwvw))
       module.addComment2(commentStr)
       self.ss._clsLoopLabel = Label(self.parentWriter.labels.getNameInc("CLS"), "")
       module.add(self.ss._clsLoopLabel)

@@ -15721,6 +15721,10 @@ class KernelWriterAssembly(KernelWriter):
       # where a smaller batch reduces register pressure or improves store pipelining).
       numElementsPerBatch = len(element)
 
+    # DEBUG: raw VGPR-allowed batch size (before NEPBS/SGPR/even caps) so the .s
+    # can show which cap actually bounds numElementsPerBatch.
+    ss.cfg.dbgVgprAllowedNEPB = numElementsPerBatch
+
     # print("numElementsPerBatch: ", numElementsPerBatch, numVgprAvailable, ss.numVgprsPerElement)
 
     # Cap batch size to align on MIWaveTile[0] (M-tile) boundaries.
@@ -15801,6 +15805,50 @@ class KernelWriterAssembly(KernelWriter):
     #  numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
     #  #print "  NumVectorsPerBatch", numVectorsPerBatch
     #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
+
+    # CompactLoopStore: size batches so they line up with the CLS loop's N-tile
+    # grouping, which lets the runtime loop compact the store. The CLS loop
+    # iterates the outermost free1/N tile (GlobalWriteBatchWriter.clsMaxNIter).
+    # Aligning each batch to one whole N-group (elemsPerNGroup = len(element)//maxNIter)
+    # makes numBatches a multiple of maxNIter so the loop can compact.
+    #   - bound by the OCCUPANCY-SAFE resource budget = min(VGPR-allowed, SGPR-limit),
+    #     NOT the NEPBS heuristic: CLS reuses one body via the loop, so a fatter batch
+    #     only trades away extra address setups, and using up to numVgprAvailable
+    #     (the block setOccupancy carved out) does not lower occupancy.
+    #   - if a whole N-group fits the budget -> one N-group per batch (batchesPerBody=1,
+    #     iterCount=maxNIter); else pick the largest divisor of the N-group that fits,
+    #     down to 1 (still a multiple of maxNIter, so still loopable).
+    #   - NO even restriction: on MI every epilogue pack is per-element/gwvw-internal
+    #     (or alpha has an across-element fallback), so odd nEPB is safe.
+    #   - skip paths the CLS loop does not cover (atomic / StoreRemap / subtile).
+    if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"] and kernel["EnableMatrixInstruction"] \
+        and not atomic and not kernel["StoreRemapVectorWidth"] and not kernel.get("UseSubtileImpl") \
+        and ss.numVgprsPerElement > 0:
+      maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
+      nElem = len(element)
+      if maxNIter > 1 and nElem % maxNIter == 0:
+        # Only re-align kernels whose NATURAL batching does not already loop, so we
+        # don't perturb already-looping kernels' batch size / scheduling.
+        # #Victor 要確認是不是要把這個條件移除擴展到全部 (i.e. also re-align
+        #   already-looping kernels, not just the non-looping ones).
+        naturalNumBatches = max(1, ceilDivide(nElem, numElementsPerBatch))
+        _, _naturalIter, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, naturalNumBatches, numElementsPerBatch, gwvw)
+        if _naturalIter <= 1:
+          elemsPerNGroup = nElem // maxNIter
+          # occupancy-safe budget: VGPR-allowed (numVgprAvailable // numVgprsPerElement)
+          # capped by the SGPR limit; deliberately ignores NEPBS.
+          budget = numVgprAvailable // ss.numVgprsPerElement
+          sgprLim = ss.cfg.numElementsPerBatchLimitedBySgprs
+          if sgprLim and sgprLim > 0:
+            budget = min(budget, sgprLim)
+          budget = max(1, budget)
+          # largest divisor of one N-group that fits the budget (== elemsPerNGroup
+          # itself when it fits -> fattest batch, most compaction); min 1.
+          for cand in range(min(elemsPerNGroup, budget), 0, -1):
+            if elemsPerNGroup % cand == 0:
+              numElementsPerBatch = cand
+              break
+
     numBatches = max(1, ceilDivide(len(element),numElementsPerBatch))
 
     # Grow pool if needed
