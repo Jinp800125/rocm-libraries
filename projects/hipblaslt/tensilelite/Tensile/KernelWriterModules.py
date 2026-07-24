@@ -282,18 +282,29 @@ def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
                                                       src=accStr,
                                                       comment="copy acc to vreg[%u]" % destIdx)
         else:
-          if write:
+          if kernel.get("CompactLoopStore", False):
+            # CompactLoopStore: use v_movrelsd_2_b32 so the M0-relative VGPR index
+            # is offset at runtime. The CLS countdown loop drives M0 per iteration
+            # so one body covers multiple MI accumulator slices. Non-CLS keeps
+            # v_mov_b32 verbatim.
+            #   read  (acc -> vreg): the accumulator (src) is the varying operand.
+            #   write (vreg -> acc): the accumulator (dst) is the varying operand.
+            # v_movrelsd_2_b32 offsets BOTH operands (src by M0[9:0], dst by
+            # M0[25:16]); the CLS loop keeps the "fixed" side's M0 field at 0 so
+            # only the accumulator index moves. The fixup write-back therefore
+            # needs M0[9:0] copied up to M0[25:16] before this instruction.
+            if write:
+              itemList[destIdx] = VMovRelsD2B32(dst=vgpr("ValuC+%u"%srcIdx),
+                                               src=vgpr(Holder(name="ValuC")),
+                                               comment="copy vreg[%u] to MI out reg" % destIdx)
+            else:
+              itemList[destIdx] = VMovRelsD2B32(dst=vgpr(Holder(name="ValuC")),
+                                               src=vgpr("ValuC+%u"%srcIdx),
+                                               comment="copy MI out reg to vreg[%u]" % destIdx)
+          elif write:
             itemList[destIdx] = VMovB32(dst=vgpr("ValuC+%u"%srcIdx),
                                              src=vgpr(Holder(name="ValuC")),
-                                             comment="copy vreg[%u] to MI out reg" % destIdx)
-          elif kernel.get("CompactLoopStore", False):
-            # CompactLoopStore: use v_movrelsd_2_b32 so the dst VGPR index is offset
-            # by M0 at runtime. The CLS countdown loop (later commit) drives M0 per
-            # iter so one "copy MI out reg" body covers multiple MI accumulator
-            # slices. Non-CLS keeps v_mov_b32 verbatim.
-            itemList[destIdx] = VMovRelsD2B32(dst=vgpr(Holder(name="ValuC")),
-                                             src=vgpr("ValuC+%u"%srcIdx),
-                                             comment="copy MI out reg to vreg[%u]" % destIdx)
+                                             comment="copy vreg[%u] to MI out reg" % destIdx)  
           else:
             itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
                                              src=vgpr("ValuC+%u"%srcIdx),
