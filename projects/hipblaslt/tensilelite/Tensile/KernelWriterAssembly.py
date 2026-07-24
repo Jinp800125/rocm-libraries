@@ -16123,6 +16123,13 @@ class KernelWriterAssembly(KernelWriter):
               _next_firing_rowInc, _direct_next_rowInc))
           biasLocalBarrierInit = True
 
+        # CompactLoopStore SRVW: the offset vgpr is checked out by batch 0 (inside
+        # GlobalWriteBatchWriter) and shared by every batch; release it here, once
+        # the last batch of this store loop has emitted.
+        if kernel["StoreRemapVectorWidth"] and kernel["CompactLoopStore"] and getattr(self, "compactLoopStoreVgpr", -1) != -1:
+          self.vgprPool.checkIn(self.compactLoopStoreVgpr)
+          self.compactLoopStoreVgpr = -1
+
         ss.resetState()
         actLoopModuleList.append(actLoopModule)
         actLoopModuleCodeLength.append(countInstruction(actLoopModule))

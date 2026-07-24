@@ -121,6 +121,10 @@ class GlobalWriteBatchWriter:
     self.cvtVgprStruct = cvtVgprStruct
     self.batchElementSgprs = batchElementSgprs
     self.tmpSgpr = tmpSgpr
+    # CompactLoopStore offset vgpr must persist across batches: checked out in
+    # batch 0, used by every batch, checked in at the last batch. Each batch is a
+    # fresh writer instance, so stash the index on parentWriter and re-read it here.
+    self.CompactLoopStoreVgpr = getattr(parentWriter, "compactLoopStoreVgpr", -1)
     self.codeAccVgprRead = codeAccVgprRead
     self.codeMulAlpha = codeMulAlpha
     self.packdata     = packdata
@@ -320,7 +324,7 @@ class GlobalWriteBatchWriter:
       return numBatches, 1, m0Step
 
     # Store paths not covered by the CLS loop, or explicit debug override: no loop.
-    if forceNoCompact or kernel.get("StoreRemapVectorWidth", 0) != 0 or kernel.get("StreamK", 0) != 0:
+    if forceNoCompact:
       return numBatches, 1, m0Step
 
     if numBatches <= 1:
@@ -755,6 +759,12 @@ class GlobalWriteBatchWriter:
 
     module.add(SMovB32(dst=sgpr(self.tmpS01),   src=0, comment="Init sgpr offset"))
     module.add(SMovB32(dst=sgpr(self.tmpS01+1), src=0, comment="Init sgpr offset"))
+    if self.kernel["StoreRemapVectorWidth"] and self.kernel["CompactLoopStore"]:
+      # Batch 0 owns the checkout; persist on parentWriter so later batches reuse it.
+      self.CompactLoopStoreVgpr = self.parentWriter.vgprPool.checkOut(1, tag="CompactLoopStoreVgpr_tmpVgpr")
+      self.parentWriter.compactLoopStoreVgpr = self.CompactLoopStoreVgpr
+      module.add(VMovB32(dst=vgpr(self.CompactLoopStoreVgpr),   src=0, comment="Init vgpr offset"))
+      # module.add(VMovB32(dst=vgpr(self.tmpVgpr+1), src=0, comment="Init vgpr offset"))
 
     # Prewarm VGPR MSB bank -- NonEdge only. Forces the upper-bank toggle
     # for the upcoming ds_load to settle ahead of time so the loop body
@@ -1439,6 +1449,8 @@ class GlobalWriteBatchWriter:
     vlcntTotalIssued = self.loadsBetaIssued + self.loadsEIssued
     dscntTotalIssued = self.localLoadsBiasIssued + self.loadsScaleAVecIssued + self.loadsScaleBVecIssued + self.loadsScaleAlphaVecIssued
     waitCnter = [vlcntTotalIssued, dscntTotalIssued]
+    # if self.kernel["StoreRemapVectorWidth"] and self.kernel["CompactLoopStore"]:
+    #   CompactLoopStoreVgpr = self.parentWriter.vgprPool.checkOut(1, tag="CompactLoopStoreVgpr_tmpVgpr")
     for elementIdx in range(0, len(self.batchElements)):
       element = self.batchElements[elementIdx]
       addrCalc: AddrCalculation = self.ss.elementAddr[elementIdx]
@@ -1477,8 +1489,13 @@ class GlobalWriteBatchWriter:
             printExit("Use E does not support StoreRemapVectorWidth if GSU == 1.")
             # module.add(addrCalc.incrementToNextRow(self.kernel, "E", self.ss, self.tmpS01, isCompute=True))
           module.add(addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01, forceinitrow0=1, overrideAfterPrimerRows=_emitOverrideRows))
-          module.add(VMovB32(vgpr(self.tmpVgpr), addrCalc.rowInc, comment="set shift rows"))
-          module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.tmpVgpr), "shift storeRemap coord1"))
+          
+          if not (self.kernel["CompactLoopStore"] and _emitOverrideRows):
+            module.add(VMovB32(vgpr(self.tmpVgpr), addrCalc.rowInc, comment="set shift rows"))
+            module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.tmpVgpr), "shift storeRemap coord1"))
+          if self.kernel["CompactLoopStore"] and _emitOverrideRows:
+            module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.CompactLoopStoreVgpr), "shift storeRemap coord1"))
+            module.add(VMovB32(vgpr(self.CompactLoopStoreVgpr), _emitOverrideRows, comment="set shift rowsss"))
 
       # When stores are interleaved (GLS=0) with subtile NonEdge guards, the
       # M-guard branch for the last store in N-group K targets the N-group end
@@ -1991,6 +2008,9 @@ class GlobalWriteBatchWriter:
           if self.storeBiasD == 1:
             self.storesIssued += 1
 
+    # NOTE: the CompactLoopStore offset vgpr is checked out by batch 0 and shared
+    # by every batch; it is released by the caller (globalWriteElementBatch) after
+    # the last batch of the store loop, not here.
     # Close the last N-group OOB skip label (if any) opened by _emitSubtileOobGuard.
     self._finalizeSubtileOobGuards(storeCode if self.kernel["GroupLoadStore"] else module)
     if self.kernel["ProblemType"]["StochasticRounding"]:
