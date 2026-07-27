@@ -999,6 +999,31 @@ class GSUOn(GSU):
             #  #print "  NumVectorsPerBatch", numVectorsPerBatch
             #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
             numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
+
+            # CompactLoopStore (partial write only): derive an N-group-aligned batch
+            # size so the partial-write batches split the tile evenly and can be
+            # folded into a CLS loop. This mirrors StreamK._skAlignNEPBForCLS and
+            # only ever SHRINKS numElementsPerBatch (stays within the VGPR/SGPR
+            # budget). The reduction pass below keeps the original
+            # numElementsPerBatch/numBatches, so only the partial write changes.
+            pwNEPB = numElementsPerBatch
+            if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not edge:
+                from .GlobalWriteBatch import GlobalWriteBatchWriter as _GWBW
+                _maxNIter = _GWBW.clsMaxNIter(kernel)
+                _nElem = len(elements[edgeI])
+                if _maxNIter > 1 and _nElem % _maxNIter == 0:
+                    _elemsPerNGroup = _nElem // _maxNIter
+                    _cdt = kernel["ProblemType"]["ComputeDataType"]
+                    _needsEven = (_cdt.isHalf() or _cdt.isBFloat16()) and ((gwvw % 2) == 1)
+                    for _cand in range(min(_elemsPerNGroup, max(1, numElementsPerBatch)), 0, -1):
+                        if _elemsPerNGroup % _cand != 0:
+                            continue
+                        if _needsEven and _cand > 1 and (_cand % 2) != 0:
+                            continue
+                        pwNEPB = _cand
+                        break
+            pwNumBatches = max(1, ceilDivide(len(elements[edgeI]), pwNEPB))
+
             numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
 
             if writer.db["PrintStoreRegisterDb"]:
@@ -1033,15 +1058,70 @@ class GSUOn(GSU):
 
                 module.add(self.syncOffsetPreparation(writer, kernel, tmpSgpr, partialWriteLabel))
 
-                for batchIdx in range(0, numBatches):
-                    elementStartIdx = batchIdx * numElementsPerBatch
-                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                    elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                    # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
-                    # elementVgprs can be large and should be perfectly tuned to the number of available
-                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
-                    module.add(self.partialWriteBatch(writer, kernel, ss, batchIdx, beta, edge, gwvw, elementsThisBatch, tmpVgpr, elementSgprs, \
-                                                      tmpSgpr, codeAccVgprRead, lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel))
+                # CompactLoopStore: fold the partial-write batches into one reused
+                # countdown loop, mirroring StreamK.partialsWriteProcedure. Each
+                # iteration steps M0 (the v_movrelsd_2_b32 src offset) to re-index
+                # the accumulator window while the workspace store offset keeps
+                # advancing. Falls back to the fully unrolled emit when the layout
+                # does not compress (iterCount<=1) or on the edge path.
+                from .GlobalWriteBatch import GlobalWriteBatchWriter
+                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, pwNumBatches, pwNEPB, gwvw)
+                pwUseCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
+                    and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
+
+                if pwUseCLS:
+                    # Hoist the batch-0 preamble (last-GSU-WG busy-wait + labels) out
+                    # of the loop body so it runs exactly once.
+                    if kernel["MbskPrefetchMethod"] == 0:
+                        module.add(lastGsuWgBusyWaitingLabel)
+                        module.add(self.lastGsuWgBusyWaiting(writer, kernel, ss, tmpSgpr, tmpVgpr, lastGsuWgBusyWaitingLabel, reductionBodyLabel))
+                        module.add(partialWriteLabel)
+                    module.addComment0("MBSK CLS (partial write) auto-adjust: numElementsPerBatch %u -> %u, numBatches=%u" %
+                        (numElementsPerBatch, pwNEPB, pwNumBatches))
+                    module.addComment0("MBSK CLS (partial write) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
+                        (clsBPB, clsIter, clsM0Step))
+                    clsCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSLoopCounter", preventOverflow=False)
+                    clsM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSm0Base", preventOverflow=False)
+                    pwInc = kernel["NumThreads"] * kernel["StoreVectorWidth"] * writer.states.bpeCinternal
+                    module.add(SMovB32(dst=sgpr(clsM0Base), src=0, comment="MBSK CLS M0 base = 0"))
+                    module.add(SMovB32(dst=sgpr(clsCounter), src=clsIter, comment="MBSK CLS loop iter count = %u" % clsIter))
+                    # The per-thread workspace store address vgpr (Serial * bpe) is
+                    # loop-invariant, so compute it ONCE here in the preamble instead
+                    # of re-emitting it every iteration inside the loop body. Use
+                    # storeOffsetSgpr (tmpSgpr.idx) as multiply scratch since it is
+                    # (re)initialized to -inc immediately afterwards.
+                    ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, elements[edgeI][0:pwNEPB], elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+                    clsAddrDVgpr = ss.elementAddr[0].addrDVgpr
+                    module.add(vectorStaticMultiply(vgpr(clsAddrDVgpr), vgpr("Serial"), kernel["StoreVectorWidth"] * writer.states.bpeCinternal, ContinuousRegister(tmpSgpr.idx, 1)))
+                    module.add(SMovB32(dst=sgpr(tmpSgpr.idx), src=hex(0),
+                                       comment="Init store offset = 0 (body stores then adds inc)"))
+                    clsLabel = Label(writer.labels.getNameInc("MBSK_PartialWrite_CLS"), "")
+                    module.add(clsLabel)
+                    module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0Base), comment="MBSK CLS M0 = base (v_movrelsd src offset)"))
+                    module.add(SAddU32(dst=sgpr(clsM0Base), src0=sgpr(clsM0Base), src1=clsM0Step, comment="MBSK CLS M0 step"))
+                    for bIdx in range(0, clsBPB):
+                        _start = bIdx * pwNEPB
+                        _stop  = min(_start + pwNEPB, len(elements[edgeI]))
+                        # bIdx==0 reuses the ss setup already done in the preamble
+                        # (for the hoisted store-address multiply), so skip re-setup
+                        # to avoid a duplicate vgprValuC checkOut.
+                        module.add(self.partialWriteBatch(writer, kernel, ss, bIdx, beta, edge, gwvw, elements[edgeI][_start:_stop], tmpVgpr, elementSgprs, \
+                                                          tmpSgpr, codeAccVgprRead, lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel, clsLoop=True, skipSetup=(bIdx == 0)))
+                    module.add(SSubU32(dst=sgpr(clsCounter), src0=sgpr(clsCounter), src1=1, comment="MBSK CLS countdown"))
+                    module.add(SCmpEQU32(src0=sgpr(clsCounter), src1=0, comment="CLS loop done?"))
+                    module.add(writer.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
+                    writer.sgprPool.checkIn(clsM0Base)
+                    writer.sgprPool.checkIn(clsCounter)
+                else:
+                    for batchIdx in range(0, numBatches):
+                        elementStartIdx = batchIdx * numElementsPerBatch
+                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
+                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
+                        # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
+                        # elementVgprs can be large and should be perfectly tuned to the number of available
+                        # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                        module.add(self.partialWriteBatch(writer, kernel, ss, batchIdx, beta, edge, gwvw, elementsThisBatch, tmpVgpr, elementSgprs, \
+                                                          tmpSgpr, codeAccVgprRead, lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel))
 
                 # synchronize GSUWG in reductionBatch. If is the last WG -> do reduction; else branch to GW_END
                 ss.firstBatch = True
@@ -1166,15 +1246,22 @@ class GSUOn(GSU):
         return module
 
     def partialWriteBatch(self, writer, kernel, ss, batchIdx, beta, edge, gwvw, batchElements, tmpVgpr, batchElementSgprs, tmpSgpr, codeAccVgprRead, \
-                          lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel):
+                          lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel, clsLoop=False, skipSetup=False):
         module = Module("GSU Common partialWriteBatch")
 
         # allow expanding vgpr pool for OptNLL
         # preventOverflow = True #(not isOptNLL)
         # ss.setupStoreElementsForBatch(kernel, gwvw, batchElements, batchElementSgprs, isOptNLL=False, factorDim=0, isWorkspace=True)
-        ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, batchElements, batchElementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+        # skipSetup: the CLS preamble already ran setup for this batch (to hoist
+        # the loop-invariant store-address multiply); re-running it here would
+        # checkOut vgprValuC again and leak it (checkFinalState failure).
+        if not skipSetup:
+            ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, batchElements, batchElementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
 
-        if batchIdx == 0 and kernel["MbskPrefetchMethod"] == 0:
+        # clsLoop: the last-GSU-WG busy-wait and the last_gsu_wg_busy_waiting /
+        # partial_write labels are emitted ONCE before the CLS loop (see
+        # reductionProcedure), so the reused loop body must not re-emit them.
+        if batchIdx == 0 and kernel["MbskPrefetchMethod"] == 0 and not clsLoop:
             module.add(lastGsuWgBusyWaitingLabel)
             module.add(self.lastGsuWgBusyWaiting(writer, kernel, ss, tmpSgpr, tmpVgpr, lastGsuWgBusyWaitingLabel, reductionBodyLabel))
             module.add(partialWriteLabel)
@@ -1182,7 +1269,9 @@ class GSUOn(GSU):
         module.addComment0("optSingleColVgpr=%u optSharedColVgpr=%u optSGPRUsage=%s optSrdIncForRow=%u" % \
             (ss.optSingleColVgpr, ss.optSharedColVgpr, ss.optSGPRUsage, ss.optSrdIncForRow))
 
-        if kernel.get("CompactLoopStore", False):
+        # clsLoop: M0 (the v_movrelsd_2_b32 src offset) is driven by the CLS loop
+        # header, so do NOT reset it here.
+        if kernel.get("CompactLoopStore", False) and not clsLoop:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
 
@@ -1232,7 +1321,10 @@ class GSUOn(GSU):
         ########################################
         # accvgpr read
         module.addComment("accvgpr read")
-        if batchIdx > 0:
+        # clsLoop: every iteration re-reads the accumulators into the same vregs
+        # the previous iteration's store is still reading, so wait for that store
+        # (the first iteration also follows the primer, harmless there).
+        if batchIdx > 0 or clsLoop:
             module.add(SWaitCnt(vlcnt=0, vscnt=0, comment="Wait previous batch write over"))
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
@@ -1286,14 +1378,24 @@ class GSUOn(GSU):
                 addr1 = sgpr("SrdD", 4)
                 globalOffset = 0
 
+                # Use "NumThreads" instead of "MIWaveGroup" because LSU will not show in "MIWaveGroup"
+                increment = kernel["NumThreads"] * storeWidth * writer.states.bpeCinternal
                 if batchIdx == 0 and elementIdx == 0:
                     addrDVgpr = addrCalc.addrDVgpr
-                    storeCodeGSUSK.add(vectorStaticMultiply(vgpr(addrDVgpr), vgpr("Serial"), storeWidth * writer.states.bpeCinternal, storeOffsetSgprRes))
-                    storeCodeGSUSK.add(SMovB32(dst=sgpr(storeOffsetSgpr), src=0, comment="Init sgpr offset for interleaved wave store"))
+                    if not clsLoop:
+                        # clsLoop: the store address vgpr (Serial * bpe) is
+                        # loop-invariant and hoisted to the preamble
+                        # (see reductionProcedure), so only advance the walking
+                        # store offset here. It was primed to -inc before the
+                        # loop, so add inc to keep the body's first element
+                        # contiguous with the previous iteration.
+                    #     storeCodeGSUSK.add(SAddU32(dst=sgpr(storeOffsetSgpr), src0=sgpr(storeOffsetSgpr), src1=increment, comment="Inc store offset (CLS)"))
+                    # else:
+                        storeCodeGSUSK.add(vectorStaticMultiply(vgpr(addrDVgpr), vgpr("Serial"), storeWidth * writer.states.bpeCinternal, storeOffsetSgprRes))
+                        storeCodeGSUSK.add(SMovB32(dst=sgpr(storeOffsetSgpr), src=0, comment="Init sgpr offset for interleaved wave store"))
                 else:
-                    # Use "NumThreads" instead of "MIWaveGroup" because LSU will not show in "MIWaveGroup"
-                    increment = kernel["NumThreads"] * storeWidth * writer.states.bpeCinternal
-                    storeCodeGSUSK.add(SAddU32(dst=sgpr(storeOffsetSgpr), src0=sgpr(storeOffsetSgpr), src1=increment, comment="Increase sgpr offset for store"))
+                    if not clsLoop:
+                        storeCodeGSUSK.add(SAddU32(dst=sgpr(storeOffsetSgpr), src0=sgpr(storeOffsetSgpr), src1=increment, comment="Increase sgpr offset for store"))
 
                 sumIdx = ss.elementSumIdx[elementIdx]
                 if not kernel["StoreRemapVectorWidth"]:
@@ -1310,6 +1412,8 @@ class GSUOn(GSU):
                     storeCodeGSUSK.add(writer.storeRemapAddLocalWrite(kernel, ss, addrCalc, sumIdx*rpe))
                     # Column Block Shape has been written to LDS
                     # Now read back and write out to global memory
+                if clsLoop:
+                    storeCodeGSUSK.add(SAddU32(dst=sgpr(storeOffsetSgpr), src0=sgpr(storeOffsetSgpr), src1=increment, comment="Inc store offset (CLS)"))
             module.add(storeCodeGSUSK)
 
         # return registers to pool:
@@ -1409,6 +1513,9 @@ class GSUOn(GSU):
         # accvgpr write
         module.add(accvgprWriteLabel)
         module.addComment("accvgpr write")
+        if kernel.get("CompactLoopStore", False):# and not clsLoop:
+                module.add(SMovB32(dst=mgpr(0), src=0,
+                    comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
         if codeAccVgprWrite is not None:
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
             if kernel["MIArchVgpr"] and kernel["LocalSplitU"] > 1:
@@ -2012,9 +2119,9 @@ class GSUOn(GSU):
 
         accvgprReadLabel = Label(writer.labels.getNameInc("last_gsu_wg_accvgpr_read"), comment="")
         module.add(accvgprReadLabel)
-        if kernel.get("CompactLoopStore", False):
-                module.add(SMovB32(dst=mgpr(0), src=0,
-                    comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
+        # if kernel.get("CompactLoopStore", False):
+        #         module.add(SMovB32(dst=mgpr(0), src=0,
+        #             comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
         module.add(SWaitCnt(vlcnt=0, comment="wait for buffer_load to finish"))
 
         tmpVAdd = tmpVgprDynamic.idx
