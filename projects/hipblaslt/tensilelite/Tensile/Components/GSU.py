@@ -1558,6 +1558,12 @@ class GSUOn(GSU):
         addr1 = sgpr(tmpS06, 4)
         addr0 = vgpr(vgproffset)
         bps = kernel["ProblemType"]["ComputeDataType"].numBytes() * gwvw
+        # chooseGlobalRead below emits one read per (WG, element), but a read wider
+        # than one buffer_load_b128 (16B) expands into several physical loads. The
+        # vlcnt bookkeeping counts logical reads, whereas the hardware loadcnt
+        # counts each buffer_load_*, so scale every SWaitCnt(vlcnt=...) by the
+        # number of physical loads per read (bps rounded up to 16B chunks).
+        loadcntPerRead = max(1, -(-bps // 16))
         storeWidth = kernel["StoreVectorWidth"]
         increment = kernel["NumThreads"] * storeWidth * writer.states.bpeCinternal
         # On gfx1250 the reducer reads workspace data that other GSU WGs wrote
@@ -1690,7 +1696,7 @@ class GSUOn(GSU):
 
                 for i in range(0, GSUP1):
                     vlcnt = vlcnt - 1 if vlcnt > 0 else 0
-                    module.add(SWaitCnt(vlcnt=vlcnt, comment="(wait for buffer ready)"))
+                    module.add(SWaitCnt(vlcnt=vlcnt*loadcntPerRead, comment="(wait for buffer ready)"))
                     if kernel["ProblemType"]["DataType"].isInt8() or kernel["ProblemType"]["DataType"].isInt32():
                         for j in range(0, int(gwvw)):
                             module.add(VAddI32(dst=vgpr(vgprstart+j), src0=vgpr(vgprstart+j), src1=vgpr(tmpVAdd+0+gwvw*i+j), \
@@ -1739,7 +1745,7 @@ class GSUOn(GSU):
                     vlcnt = k
                     for i in range(0, k):
                         vlcnt = vlcnt - 1 if vlcnt > 0 else 0
-                        module.add(SWaitCnt(vlcnt=vlcnt, comment="(wait for buffer ready)"))
+                        module.add(SWaitCnt(vlcnt=vlcnt*loadcntPerRead, comment="(wait for buffer ready)"))
                         if kernel["ProblemType"]["DataType"].isInt8() or kernel["ProblemType"]["DataType"].isInt32():
                             for j in range(0, int(gwvw)):
                                 module.add(VAddI32(dst=vgpr(vgprstart+j), src0=vgpr(vgprstart+j), src1=vgpr(tmpVAdd+0+gwvw*i+j), \
@@ -1865,7 +1871,7 @@ class GSUOn(GSU):
                 vgprstart   = ss.elementSumIdx[elementIdx]
                 vlcnt       = vlcnt - 2 if vlcnt > 0 else 0
 
-                module.add(SWaitCnt(vlcnt=vlcnt, comment="(wait for buffer ready)"))
+                module.add(SWaitCnt(vlcnt=vlcnt*loadcntPerRead, comment="(wait for buffer ready)"))
                 if kernel["ProblemType"]["DataType"].isInt8() or kernel["ProblemType"]["DataType"].isInt32():
                     for j in range(0, int(gwvw)):
                         module.add(VAddI32(dst=vgpr(vgprstart+j), src0=vgpr(vgprstart+j), src1=vgpr(data+j), \
@@ -1907,7 +1913,7 @@ class GSUOn(GSU):
                     vgprstart   = ss.elementSumIdx[elementIdx]
                     vlcnt       = vlcnt - 1 if vlcnt > 0 else 0
 
-                    module.add(SWaitCnt(vlcnt=vlcnt, comment="(wait for buffer ready)"))
+                    module.add(SWaitCnt(vlcnt=vlcnt*loadcntPerRead, comment="(wait for buffer ready)"))
                     if kernel["ProblemType"]["DataType"].isInt8() or kernel["ProblemType"]["DataType"].isInt32():
                         for j in range(0, int(gwvw)):
                             module.add(VAddI32(dst=vgpr(vgprstart+j), src0=vgpr(vgprstart+j), src1=vgpr(data+j), \
@@ -1952,7 +1958,7 @@ class GSUOn(GSU):
                     vgprstart   = ss.elementSumIdx[elementIdx]
                     data  = tmpVAdd[-1][elementIdx]
 
-                    module.add(SWaitCnt(vlcnt=vlcnt, comment="(wait for buffer ready)"))
+                    module.add(SWaitCnt(vlcnt=vlcnt*loadcntPerRead, comment="(wait for buffer ready)"))
                     if kernel["ProblemType"]["DataType"].isInt8() or kernel["ProblemType"]["DataType"].isInt32():
                         for j in range(0, int(gwvw)):
                             module.add(VAddI32(dst=vgpr(vgprstart+j), src0=vgpr(vgprstart+j), src1=vgpr(data+j), \
@@ -1973,7 +1979,7 @@ class GSUOn(GSU):
                         vgprstart   = ss.elementSumIdx[elementIdx]
                         data  = tmpVAdd[i-1][elementIdx]
 
-                        module.add(SWaitCnt(vlcnt=vlcnt, comment="(wait for buffer ready)"))
+                        module.add(SWaitCnt(vlcnt=vlcnt*loadcntPerRead, comment="(wait for buffer ready)"))
                         if kernel["ProblemType"]["DataType"].isInt8() or kernel["ProblemType"]["DataType"].isInt32():
                             for j in range(0, int(gwvw)):
                                 module.add(VAddI32(dst=vgpr(vgprstart+j), src0=vgpr(vgprstart+j), src1=vgpr(data+j), \
