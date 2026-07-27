@@ -1125,16 +1125,68 @@ class GSUOn(GSU):
 
                 # synchronize GSUWG in reductionBatch. If is the last WG -> do reduction; else branch to GW_END
                 ss.firstBatch = True
-                for batchIdx in range(0, numBatches):
-                    elementStartIdx = batchIdx * numElementsPerBatch
-                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                    elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                    # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
-                    # elementVgprs can be large and should be perfectly tuned to the number of available
-                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
-                    module.add(self.reductionBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, atomic, \
-                            gwvw, elementsThisBatch, tmpVgpr, tmpVgprDynamic, elementSgprs, tmpSgpr, \
-                            codeAccVgprReadBackup, codeAccVgprWrite, reductionBodyLabel, endLabel))
+                # CompactLoopStore: fold the reduction batches into one reused countdown
+                # loop, mirroring the partial-write CLS path above. Each iteration steps
+                # M0 on the DST side (M0[25:16] for v_movrelsd_2_b32 accvgpr-write) so one
+                # body re-indexes the accumulator window, while the workspace LOAD offset
+                # keeps advancing continuously. Falls back to fully-unrolled emit when the
+                # layout does not compress (iterCount<=1), on the edge path, or for a
+                # non-MBSK accumulation mode.
+                rdBPB, rdIter, rdM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)
+                rdUseCLS = kernel.get("CompactLoopStore", False) and rdIter > 1 \
+                    and codeAccVgprWrite is not None and kernel["LocalSplitU"] == 1 and not edge \
+                    and kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'
+
+                if rdUseCLS:
+                    module.addComment0("MBSK CLS (reduction) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
+                        (rdBPB, rdIter, rdM0Step))
+                    rdCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSRdLoopCounter", preventOverflow=False)
+                    rdM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSRdm0Base", preventOverflow=False)
+                    rdGsuM1   = writer.sgprPool.checkOut(1, tag="MBSKCLSRdGsuCount", preventOverflow=False)
+                    # Hoist the once-per-reduction preamble (atomic dec / synchronizer
+                    # wait / reductionBodyLabel / load-address + SRD setup / loadOffset
+                    # prime / GSU count save) out of the loop body. The setup here also
+                    # fixes the pool indices of the per-thread load-address vgpr and the
+                    # sumIdx vregs so bIdx==0 in the body can reuse them (skipSetup).
+                    firstBatchElements = elements[edgeI][0:numElementsPerBatch]
+                    ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, firstBatchElements, elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+                    module.add(self.GSUSynccodegenOpt(kernel, writer, ss, 0, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw, firstBatchElements, \
+                            endLabel, ss.elementSumIdx[0], ss.elementAddr[0].addrDVgpr, reductionBodyLabel, \
+                            clsLoop=True, clsPreambleOnly=True, clsGsuM1Sgpr=rdGsuM1))
+                    module.add(SMovB32(dst=sgpr(rdM0Base), src=0, comment="MBSK CLS (reduction) M0 base = 0"))
+                    module.add(SMovB32(dst=sgpr(rdCounter), src=rdIter, comment="MBSK CLS (reduction) loop iter count = %u" % rdIter))
+                    rdClsLabel = Label(writer.labels.getNameInc("MBSK_Reduction_CLS"), "")
+                    module.add(rdClsLabel)
+                    # Each reductionBatch sets M0 itself from rdM0Base: M0[9:0] before the
+                    # accvgpr READ (acc is src) and M0[25:16] before the accvgpr WRITE
+                    # (acc is dst). rdM0Base holds this iteration's offset (i*m0Step) and
+                    # is stepped AFTER the body so the body reads the pre-increment value.
+                    for bIdx in range(0, rdBPB):
+                        elementStartIdx = bIdx * numElementsPerBatch
+                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
+                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
+                        module.add(self.reductionBatch(writer, kernel, ss, bIdx, alpha, beta, edge, atomic, \
+                                gwvw, elementsThisBatch, tmpVgpr, tmpVgprDynamic, elementSgprs, tmpSgpr, \
+                                codeAccVgprReadBackup, codeAccVgprWrite, reductionBodyLabel, endLabel, \
+                                clsLoop=True, clsSkipPreamble=True, skipSetup=(bIdx == 0), clsGsuM1Sgpr=rdGsuM1, clsM0BaseSgpr=rdM0Base))
+                    module.add(SAddU32(dst=sgpr(rdM0Base), src0=sgpr(rdM0Base), src1=rdM0Step, comment="MBSK CLS (reduction) M0 step (after body)"))
+                    module.add(SSubU32(dst=sgpr(rdCounter), src0=sgpr(rdCounter), src1=1, comment="MBSK CLS (reduction) countdown"))
+                    module.add(SCmpEQU32(src0=sgpr(rdCounter), src1=0, comment="CLS reduction loop done?"))
+                    module.add(writer.longBranchScc0(rdClsLabel, posNeg=-1, comment="loop while counter != 0"))
+                    writer.sgprPool.checkIn(rdGsuM1)
+                    writer.sgprPool.checkIn(rdM0Base)
+                    writer.sgprPool.checkIn(rdCounter)
+                else:
+                    for batchIdx in range(0, numBatches):
+                        elementStartIdx = batchIdx * numElementsPerBatch
+                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
+                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
+                        # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
+                        # elementVgprs can be large and should be perfectly tuned to the number of available
+                        # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                        module.add(self.reductionBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, atomic, \
+                                gwvw, elementsThisBatch, tmpVgpr, tmpVgprDynamic, elementSgprs, tmpSgpr, \
+                                codeAccVgprReadBackup, codeAccVgprWrite, reductionBodyLabel, endLabel))
 
                 module.add(SWaitCnt(vlcnt=0, comment="wait for buffer_load to finish"))
                 if kernel["MbskPrefetchMethod"] == 0:
@@ -1442,7 +1494,8 @@ class GSUOn(GSU):
         return module
 
     def reductionBatch(self, writer, kernel, ss, batchIdx, alpha, beta, edge, atomic, gwvw, batchElements, tmpVgpr, tmpVgprDynamic, \
-                       batchElementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite, reductionBodyLabel, endLabel):
+                       batchElementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite, reductionBodyLabel, endLabel, clsLoop=False, clsSkipPreamble=False, \
+                       skipSetup=False, clsGsuM1Sgpr=None, clsM0BaseSgpr=None):
         module = Module("GSU Common reductionBatch")
 
         module.addComment0("optSingleColVgpr=%u optSharedColVgpr=%u optSGPRUsage=%s optSrdIncForRow=%u" % \
@@ -1465,7 +1518,11 @@ class GSUOn(GSU):
         # allow expanding vgpr pool for OptNLL
         # preventOverflow = True #(not isOptNLL)
         # ss.setupStoreElementsForBatch(kernel, gwvw, batchElements, batchElementSgprs, isOptNLL=False, factorDim=0, isWorkspace=True)
-        ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, batchElements, batchElementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+        # In the CLS reduction loop, bIdx==0 reuses the setup already performed in the
+        # hoisted preamble (so the per-thread load-address vgpr and sumIdx vregs keep
+        # the same pool indices), avoiding a duplicate vgprValuC checkOut.
+        if not skipSetup:
+            ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, batchElements, batchElementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
 
         ########################################
         # On input, coord0 and coord1 are VGPRs computed in the pre-batch code, based
@@ -1499,13 +1556,18 @@ class GSUOn(GSU):
         
         if (kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'):
             module.add(self.GSUSynccodegenOpt(kernel, writer, ss, batchIdx, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw, batchElements,\
-                                              endLabel, sumIdxGSUSYNC, addrCalc.addrDVgpr, reductionBodyLabel))
+                                              endLabel, sumIdxGSUSYNC, addrCalc.addrDVgpr, reductionBodyLabel, clsLoop=clsLoop, clsSkipPreamble=clsSkipPreamble, clsGsuM1Sgpr=clsGsuM1Sgpr))
             module.addComment("synchronizer store end")
             if kernel["MbskPrefetchMethod"] == 0:
                 module.add(SAndB32(dst=sgpr(tmpSgpr.idx), src0=sgpr("GSU"), src1=writer.gsuMaskHex(kernel), comment="Restore GSU"))
                 module.add(SCmpGtI32(src0=sgpr(tmpSgpr.idx), src1=self.gsuThreshold, comment="GSU > %u ?" % self.gsuThreshold))
                 module.add(SCBranchSCC1(labelName=accvgprWriteLabel.getLabelName(), comment="branch if true"))
                 module.addComment("GSU <= %u, do accvgpr_read for the last gsu wg" % self.gsuThreshold)
+                if clsLoop and clsM0BaseSgpr is not None:
+                    # accvgpr READ (acc -> vreg): accumulator is the SRC operand, so it
+                    # steps via M0[9:0]; keep M0[25:16]=0 so the vreg dst is not offset.
+                    module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0BaseSgpr),
+                        comment="MBSK CLS (reduction) M0[9:0] = acc src offset for accvgpr read"))
                 module.add(self.lastGsuWgReduction(kernel, writer, ss, batchIdx, tmpVgpr, tmpVgprDynamic, gwvw, batchElements, \
                                                codeAccVgprRead, addrCalc.globalOffset, addrCalc.addrDVgpr))
 
@@ -1513,7 +1575,18 @@ class GSUOn(GSU):
         # accvgpr write
         module.add(accvgprWriteLabel)
         module.addComment("accvgpr write")
-        if kernel.get("CompactLoopStore", False):# and not clsLoop:
+        if kernel.get("CompactLoopStore", False):
+            if clsLoop and clsM0BaseSgpr is not None:
+                # accvgpr WRITE (vreg -> acc): accumulator is the DST operand, so it
+                # steps via M0[25:16]; put the offset there (and clear M0[9:0] so the
+                # vreg src is not offset). Recompute from the saved base register so an
+                # earlier accvgpr READ in the same body (which used M0[9:0]) does not
+                # matter, and so multiple batches per body all get the same offset.
+                module.add(SLShiftLeftB32(dst=mgpr(0), src=sgpr(clsM0BaseSgpr), shiftHex=hex(16),
+                    comment="MBSK CLS (reduction) M0[25:16] = acc dst offset for accvgpr write"))
+            elif clsLoop:
+                pass
+            else:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
         if codeAccVgprWrite is not None:
@@ -1645,7 +1718,8 @@ class GSUOn(GSU):
         return module
 
     def GSUSynccodegenOpt(self, kernel, writer, ss, batchIdx, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw, batchElements, \
-                          labelend, vgprstart, vgproffset, reductionBodyLabel):
+                          labelend, vgprstart, vgproffset, reductionBodyLabel, clsLoop=False, clsSkipPreamble=False, \
+                          clsPreambleOnly=False, clsGsuM1Sgpr=None):
         module = Module("GSUSYNC")
 
         reductionSkipLabel = Label(writer.labels.getNameInc("reduction_skip"), comment="")
@@ -1680,7 +1754,7 @@ class GSUOn(GSU):
             if writer.states.archCaps["DefaultScopeIsCULocal"] else CacheScope.SCOPE_NONE
 
 
-        if batchIdx == 0:
+        if batchIdx == 0 and not clsSkipPreamble:
             # wait for write to ws and do atomic dec to synchronizer
             module.addComment("check done start")
             module.add(SWaitCnt(waitAll=True, comment="wait store done before synchronizer start load and add"))
@@ -1707,7 +1781,11 @@ class GSUOn(GSU):
             # calculate the address for read from ws
             addrCalc = ss.elementAddr[0]
             addrDVgpr = addrCalc.addrDVgpr
-            module.add(SMovB32(sgpr(loadOffsetSgpr), 0, "Init sgpr offset for interleaved wave load"))
+            # For the CLS reduction loop the per-element load offset walks continuously
+            # across all iterations (add-then-load). Prime it to -increment so the first
+            # unconditional add lands the very first load on offset 0.
+            loadOffsetInit = ((-increment) & 0xffffffff) if clsLoop else 0
+            module.add(SMovB32(sgpr(loadOffsetSgpr), loadOffsetInit, "Init sgpr offset for interleaved wave load"))
             module.add(vectorStaticMultiply(vgpr(addrDVgpr), vgpr("Serial"), storeWidth * writer.states.bpeCinternal, storeOffsetSgprRes))
             module.add(VMovB32(dst=vgpr(bufferOOB), src="BufferOOB"))
             module.addComment("synchronizer sum offset is equal to MTOffset (=MT0*MT1*bpeC)")
@@ -1725,6 +1803,23 @@ class GSUOn(GSU):
                 module.addComment("GSU <= %u, so we minus 1 from GSUSync at the beginning" % self.gsuThreshold)
                 module.add(SSubI32(dst=sgpr(tmpS02), src0=sgpr(tmpS02), src1=1, comment="Use GSU-1"))
                 module.add(reductionAllGsuWgLabel)
+
+            # CLS reduction loop: the preamble runs once, but each loop-body batch
+            # re-inits GSUSync. tmpS02 lives inside this function (checked in/out per
+            # call) so its value cannot be relied on across the hoisted preamble; copy
+            # the GSU count into a caller-owned persistent sgpr instead.
+            if clsLoop and clsGsuM1Sgpr is not None:
+                module.add(SMovB32(dst=sgpr(clsGsuM1Sgpr), src=sgpr(tmpS02), comment="save GSU count for CLS reduction loop"))
+
+        # clsPreambleOnly: the driver only wants the once-per-reduction preamble
+        # (atomic dec / synchronizer wait / reductionBodyLabel / addr+SRD setup /
+        # loadOffset prime). Emit it and return before the per-batch accumulation.
+        if clsPreambleOnly:
+            writer.sgprPool.checkIn(tmpS06)
+            writer.sgprPool.checkIn(tmpS05)
+            writer.sgprPool.checkIn(tmpS02)
+            writer.sgprPool.checkIn(tmpS01)
+            return module
 
         if not kernel["MbskPrefetchMethod"]:
             for elementIdx in range(0, len(batchElements)):
@@ -1748,7 +1843,7 @@ class GSUOn(GSU):
                 #####################################load buffer#####################################
                 module.addComment("buffer load start")
                 for times in range(elementIdx, elementIdx+1):
-                    if batchIdx != 0 or elementIdx != 0:
+                    if clsLoop or batchIdx != 0 or elementIdx != 0:
                         module.add(SAddU32(dst=sgpr(loadOffsetSgpr), src0=sgpr(loadOffsetSgpr), src1=increment, comment="Increase sgpr offset for load"))
                         module.add(SMulHIU32(dst=sgpr(tmpS06+1), src0="MTOffset", src1=sgpr("GSUStartWGIdx"), comment="(MT0*MT1*bpeC)*WGIdx"))
                         module.add(SMulI32(dst=sgpr(tmpS06), src0="MTOffset", src1=sgpr("GSUStartWGIdx"), comment="(MT0*MT1*bpeC)*WGIdx"))
@@ -1765,7 +1860,8 @@ class GSUOn(GSU):
                 SyncloadedData += 1
 
                 # Init GSUSync for different batch
-                module.add(SMovB32(dst=sgpr("GSUSync"), src=sgpr(tmpS02), comment="Init GSUSync to GSU for batch %u" % batchIdx))
+                gsuInitSrc = sgpr(clsGsuM1Sgpr) if (clsLoop and clsGsuM1Sgpr is not None) else sgpr(tmpS02)
+                module.add(SMovB32(dst=sgpr("GSUSync"), src=gsuInitSrc, comment="Init GSUSync to GSU for batch %u" % batchIdx))
 
                 SynchronizerlabelString = "Synchronizer_read_add"
                 SynchronizerComment = "Synchronizer read add"
@@ -1907,7 +2003,8 @@ class GSUOn(GSU):
             accumulationStartlabel = Label(writer.labels.getNameInc("Accumulation_Start"), "Accumulation Start")
             accumulationEndlabel   = Label(writer.labels.getNameInc("Accumulation_End"), "Accumulation End")
             # Init GSUSync for different batch
-            module.add(SMovB32(dst=sgpr("GSUSync"), src=sgpr(tmpS02), comment="Init GSUSync to GSU for batch %u" % batchIdx))
+            gsuInitSrc = sgpr(clsGsuM1Sgpr) if (clsLoop and clsGsuM1Sgpr is not None) else sgpr(tmpS02)
+            module.add(SMovB32(dst=sgpr("GSUSync"), src=gsuInitSrc, comment="Init GSUSync to GSU for batch %u" % batchIdx))
 
             # pre-load
             SyncloadedData = 0
@@ -1916,7 +2013,7 @@ class GSUOn(GSU):
             for elementIdx in range(0, len(batchElements)):
                 addrCalc: AddrCalculation = ss.elementAddr[elementIdx]
                 addr0    = vgpr(addrCalc.addrDVgpr)
-                if batchIdx != 0 or elementIdx != 0:
+                if clsLoop or batchIdx != 0 or elementIdx != 0:
                     module.add(SAddU32(dst=sgpr(loadOffsetSgpr), src0=sgpr(loadOffsetSgpr), src1=increment, comment="Increase sgpr offset for load"))
                 if elementIdx == 0:
                     module.add(SMovB32(dst=sgpr(tmpS01), src=sgpr(loadOffsetSgpr), comment="save first element offset"))
