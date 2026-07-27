@@ -1065,7 +1065,7 @@ class GSUOn(GSU):
                 # advancing. Falls back to the fully unrolled emit when the layout
                 # does not compress (iterCount<=1) or on the edge path.
                 from .GlobalWriteBatch import GlobalWriteBatchWriter
-                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, pwNumBatches, pwNEPB, gwvw)
+                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, pwNumBatches, pwNEPB, gwvw, flatWorkspaceWalk=True)
                 pwUseCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
                     and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
 
@@ -1132,7 +1132,7 @@ class GSUOn(GSU):
                 # keeps advancing continuously. Falls back to fully-unrolled emit when the
                 # layout does not compress (iterCount<=1), on the edge path, or for a
                 # non-MBSK accumulation mode.
-                rdBPB, rdIter, rdM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)
+                rdBPB, rdIter, rdM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw, flatWorkspaceWalk=True)
                 rdUseCLS = kernel.get("CompactLoopStore", False) and rdIter > 1 \
                     and codeAccVgprWrite is not None and kernel["LocalSplitU"] == 1 and not edge \
                     and kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'

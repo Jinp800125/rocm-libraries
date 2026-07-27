@@ -291,7 +291,7 @@ class GlobalWriteBatchWriter:
     return 1
 
   @staticmethod
-  def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False):
+  def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False, flatWorkspaceWalk: bool = False):
     """Single source of truth for the CLS loop layout math.
 
     Returns (batchesPerCLSBody, iterCount, m0Step).
@@ -332,7 +332,17 @@ class GlobalWriteBatchWriter:
 
     # (A) The CLS loop can compact only the OUTERMOST N tile dimension (see
     # clsMaxNIter). If there is none (maxNIter == 1) there is nothing to loop.
-    maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
+    #
+    # flatWorkspaceWalk: for batches whose per-iteration address is a FLAT linear
+    # walk (soffset += increment) instead of incToNextRow (SrdD += StrideD1J) --
+    # namely the MBSK partial-write and reduction workspace batches -- constraint
+    # (A) is vacuous: the store/load offset advances element-by-element regardless
+    # of the M/N tile structure or SourceSwap, so ANY whole-batch grouping is a
+    # valid N-agnostic address step. The only real requirement is (B) the uniform
+    # acc->arch permutation step below, which _uniformStep verifies. So allow the
+    # full numBatches range and let (B) pick the largest compressible iterCount
+    # (this in particular enables SourceSwap=0 layouts that clsMaxNIter blocks).
+    maxNIter = numBatches if flatWorkspaceWalk else GlobalWriteBatchWriter.clsMaxNIter(kernel)
     if maxNIter <= 1:
       return numBatches, 1, m0Step
 

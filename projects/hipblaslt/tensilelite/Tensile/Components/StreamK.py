@@ -1281,7 +1281,10 @@ class StreamK(Component):
             # unrolled emit when the layout does not compress (iterCount<=1) or on
             # the edge path, so non-CLS codegen is byte-identical.
             from .GlobalWriteBatch import GlobalWriteBatchWriter
-            clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)
+            # partials-write walks a FLAT workspace buffer (soffset += inc), so the
+            # clsMaxNIter N-only address constraint is vacuous here; flatWorkspaceWalk
+            # lets _uniformStep pick the largest compressible iterCount (enables SS=0).
+            clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw, flatWorkspaceWalk=True)
             useCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
                 and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
 
@@ -1968,7 +1971,11 @@ class StreamK(Component):
                 # layout does not compress (iterCount<=1) or on the edge path, so
                 # non-CLS codegen is unchanged.
                 from .GlobalWriteBatch import GlobalWriteBatchWriter
-                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)
+                # fixup loads partials from / accumulates over a FLAT workspace buffer
+                # (soffset += inc); the final strided D-store is a separate emit that
+                # keeps clsMaxNIter. So the fixup CLS loop's address side is vacuous ->
+                # flatWorkspaceWalk lets _uniformStep pick the largest iterCount (SS=0).
+                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw, flatWorkspaceWalk=True)
                 useCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
                     and codeAccVgprRead is not None and codeAccVgprWrite is not None \
                     and kernel["LocalSplitU"] == 1 and not edge
