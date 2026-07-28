@@ -13366,6 +13366,7 @@ class KernelWriterAssembly(KernelWriter):
 
   def globalWriteWorkGroupInit(self, kernel):
     module = Module("globalWriteWorkGroupInit")
+
     if kernel["BufferStore"]:
       module.add(self.allocPostLoopSrd("D", kernel))
       module.add(self.allocPostLoopSrd("C", kernel))

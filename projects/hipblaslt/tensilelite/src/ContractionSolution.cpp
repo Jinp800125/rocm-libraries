@@ -645,114 +645,6 @@ namespace TensileLite
                 args.template append<void*>("Flags", inputs.Synchronizer);
         }
 
-        bool singleWSD = false;
-        if(sizeMapping.globalAccumulation == 1
-           && (problemType.computeType != problemType.dType
-               || problemType.activationType != ActivationType::None))
-            singleWSD = true;
-        // Additional check for General Batched GEMM until GSU and StreamK are supported
-        // in General Batched GEMM
-        if(gsu > 1 && sizeMapping.streamK == 0
-           && ((singleWSD || sizeMapping.globalAccumulation == 2)
-               || (sizeMapping.globalAccumulation == 3)))
-        {
-            args.template append<void const*>("ws_d", (uint8_t*)inputs.ws + workspaceOffsetInByte);
-            if(sizeMapping.globalAccumulation == 3)
-            {
-                args.template append<void const*>("c", inputs.c);
-            }
-            else
-            {
-                args.template append<void const*>("ws_c",
-                                                  (uint8_t*)inputs.ws + workspaceOffsetInByte);
-            }
-        }
-        else if(problemType.stridedBatched)
-        {
-            if(sizeMapping.streamK > 0 && sk.reduction == origami::reduction_t::parallel)
-            {
-                args.template append<void const*>("ws_d",
-                                                  (uint8_t*)inputs.ws + workspaceOffsetInByte);
-                args.template append<void const*>("ws_c",
-                                                  (uint8_t*)inputs.ws + workspaceOffsetInByte);
-            }
-            else
-            {
-                args.template append<void const*>("d", inputs.d);
-                args.template append<void const*>("c", inputs.c);
-            }
-        }
-        else
-        {
-            args.template append<void const* const*>("batchD", inputs.batchD);
-            args.template append<void const* const*>("batchC", inputs.batchC);
-        }
-
-        size_t startStrideCD = problemType.useInitialStridesCD ? 0 : 1;
-
-        // Pass wsStride if it's not in MBSK mode
-        bool gsuWSStride
-            = gsu > 1 && sizeMapping.globalAccumulation != 3 && sizeMapping.streamK == 0;
-        bool skWSStride = sizeMapping.streamK > 0 && sk.reduction == origami::reduction_t::parallel;
-        // Additional check for General Batched GEMM until GSU and StreamK are supported
-        // in General Batched GEMM
-        if(gsuWSStride || skWSStride)
-        {
-            size_t wsStride = startStrideCD ? d.sizes()[0] : 1;
-            for(size_t i = startStrideCD; i < d.dimensions(); i++)
-            {
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideW_D", i), wsStride);
-                wsStride *= d.sizes()[i];
-            }
-
-            wsStride = startStrideCD ? d.sizes()[0] : 1;
-            for(size_t i = startStrideCD; i < c.dimensions(); i++)
-            {
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideW_C", i), wsStride);
-                wsStride *= d.sizes()[i];
-            }
-        }
-        else
-        {
-            for(size_t i = startStrideCD; i < d.dimensions(); i++)
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideD", i),
-                                               d.strides()[i]);
-
-            for(size_t i = startStrideCD; i < c.dimensions(); i++)
-                args.template append<uint32_t>(concatenate_if<T_Debug>("strideC", i),
-                                               c.strides()[i]);
-        }
-
-        args.append("alpha", inputs.alpha, problem.alphaType());
-
-        if(problem.alphaType() == rocisa::DataType::Half)
-            args.append("alpha_2", inputs.alpha, problem.alphaType());
-
-        if(problemType.useBeta)
-        {
-            args.append("beta", inputs.beta, problem.betaType());
-            
-            if(problem.betaType() == rocisa::DataType::Half)
-                args.append("beta_2", inputs.beta, problem.betaType());
-        }
-
-        if(sizeMapping.expertSchedulingMode > 0)
-        {
-            hip::HipAMDGPU const* hipAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(hardware);
-            if(hipAMDGPU
-               && (hipAMDGPU->processor == AMDGPU::Processor::gfx1200
-                   || hipAMDGPU->processor == AMDGPU::Processor::gfx1201))
-            {
-                int32_t esmRuntimeSupported = 0;
-#if HIP_VERSION >= 70353390
-                HIP_CHECK_EXC(hipDeviceGetAttribute(&esmRuntimeSupported,
-                                                    hipDeviceAttributeExpertSchedMode,
-                                                    hipAMDGPU->deviceId));
-#endif
-                args.template append<int32_t>("ESMRuntimeSupported", esmRuntimeSupported);
-            }
-        }
-
         // Additional check for General Batched GEMM until GSU and StreamK are supported
         // in General Batched GEMM
         if(sizeMapping.streamK != 0)
@@ -970,6 +862,114 @@ namespace TensileLite
                         args.template append<uint32_t>("skTiles", skTiles);
                     }
                 }
+            }
+        }
+
+        bool singleWSD = false;
+        if(sizeMapping.globalAccumulation == 1
+           && (problemType.computeType != problemType.dType
+               || problemType.activationType != ActivationType::None))
+            singleWSD = true;
+        // Additional check for General Batched GEMM until GSU and StreamK are supported
+        // in General Batched GEMM
+        if(gsu > 1 && sizeMapping.streamK == 0
+           && ((singleWSD || sizeMapping.globalAccumulation == 2)
+               || (sizeMapping.globalAccumulation == 3)))
+        {
+            args.template append<void const*>("ws_d", (uint8_t*)inputs.ws + workspaceOffsetInByte);
+            if(sizeMapping.globalAccumulation == 3)
+            {
+                args.template append<void const*>("c", inputs.c);
+            }
+            else
+            {
+                args.template append<void const*>("ws_c",
+                                                  (uint8_t*)inputs.ws + workspaceOffsetInByte);
+            }
+        }
+        else if(problemType.stridedBatched)
+        {
+            if(sizeMapping.streamK > 0 && sk.reduction == origami::reduction_t::parallel)
+            {
+                args.template append<void const*>("ws_d",
+                                                  (uint8_t*)inputs.ws + workspaceOffsetInByte);
+                args.template append<void const*>("ws_c",
+                                                  (uint8_t*)inputs.ws + workspaceOffsetInByte);
+            }
+            else
+            {
+                args.template append<void const*>("d", inputs.d);
+                args.template append<void const*>("c", inputs.c);
+            }
+        }
+        else
+        {
+            args.template append<void const* const*>("batchD", inputs.batchD);
+            args.template append<void const* const*>("batchC", inputs.batchC);
+        }
+
+        size_t startStrideCD = problemType.useInitialStridesCD ? 0 : 1;
+
+        // Pass wsStride if it's not in MBSK mode
+        bool gsuWSStride
+            = gsu > 1 && sizeMapping.globalAccumulation != 3 && sizeMapping.streamK == 0;
+        bool skWSStride = sizeMapping.streamK > 0 && sk.reduction == origami::reduction_t::parallel;
+        // Additional check for General Batched GEMM until GSU and StreamK are supported
+        // in General Batched GEMM
+        if(gsuWSStride || skWSStride)
+        {
+            size_t wsStride = startStrideCD ? d.sizes()[0] : 1;
+            for(size_t i = startStrideCD; i < d.dimensions(); i++)
+            {
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideW_D", i), wsStride);
+                wsStride *= d.sizes()[i];
+            }
+
+            wsStride = startStrideCD ? d.sizes()[0] : 1;
+            for(size_t i = startStrideCD; i < c.dimensions(); i++)
+            {
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideW_C", i), wsStride);
+                wsStride *= d.sizes()[i];
+            }
+        }
+        else
+        {
+            for(size_t i = startStrideCD; i < d.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideD", i),
+                                               d.strides()[i]);
+
+            for(size_t i = startStrideCD; i < c.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideC", i),
+                                               c.strides()[i]);
+        }
+
+        args.append("alpha", inputs.alpha, problem.alphaType());
+
+        if(problem.alphaType() == rocisa::DataType::Half)
+            args.append("alpha_2", inputs.alpha, problem.alphaType());
+
+        if(problemType.useBeta)
+        {
+            args.append("beta", inputs.beta, problem.betaType());
+
+            if(problem.betaType() == rocisa::DataType::Half)
+                args.append("beta_2", inputs.beta, problem.betaType());
+        }
+
+        if(sizeMapping.expertSchedulingMode > 0)
+        {
+            hip::HipAMDGPU const* hipAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(hardware);
+            if(hipAMDGPU
+               && (hipAMDGPU->processor == AMDGPU::Processor::gfx1200
+                   || hipAMDGPU->processor == AMDGPU::Processor::gfx1201))
+            {
+                int32_t esmRuntimeSupported = 0;
+#if HIP_VERSION >= 70353390
+                HIP_CHECK_EXC(hipDeviceGetAttribute(&esmRuntimeSupported,
+                                                    hipDeviceAttributeExpertSchedMode,
+                                                    hipAMDGPU->deviceId));
+#endif
+                args.template append<int32_t>("ESMRuntimeSupported", esmRuntimeSupported);
             }
         }
 

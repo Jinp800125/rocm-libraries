@@ -9131,6 +9131,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.states.numSgprPreload = self.states.archCaps["MaxSgprPreload"] - self.states.rpga - kernel["ProblemType"]["NumIndicesC"]
       else:
         self.states.numSgprPreload = self.states.archCaps["MaxSgprPreload"] - self.states.rpga
+      print(f"self.states.numSgprPreload: {self.states.numSgprPreload}")
+      print(f"self.states.rpga: {self.states.rpga}")
+      print(f"kernel['ProblemType']['NumIndicesC']: {kernel['ProblemType']['NumIndicesC']}")
 
       # Safe guard for preload arguments
       while(1):
@@ -9185,30 +9188,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("AddressFlags", numSgprAddressFlags)
       self.states.numSgprStreamK += numSgprAddressWS + numSgprAddressFlags
 
-    # D/C output buffers
-    self.defineSgpr("AddressD", numSgprAddressD)
-    self.defineSgpr("AddressC", numSgprAddressC)
-
-    # C/D strides
-    self.defineSgpr("StridesD", self.states.d.numSgprStrides)
-    self.defineSgpr("StridesC", self.states.c.numSgprStrides)
-
-    # for packed batches without stride restrictions need to do something different here
-    assert sorted(kernel["PackedC0IdxChars"]+kernel["PackedC1IdxChars"]) == \
-           sorted(set(kernel["PackedC0IdxChars"]+kernel["PackedC1IdxChars"]))
-    for idxChar in kernel["PackedC0IdxChars"][:-1]:
-      self.defineSgpr("MagicNumberSize%s"%idxChar, 1)
-      self.defineSgpr("MagicShiftSize%s"%idxChar, 1)
-    for idxChar in kernel["PackedC1IdxChars"][:-1]:
-      self.defineSgpr("MagicNumberSize%s"%idxChar, 1)
-      self.defineSgpr("MagicShiftSize%s"%idxChar, 1)
-
-    self.defineSgpr("Alpha", numSgprAlpha, numSgprAlpha)
-    self.states.numSgprAlpha = numSgprAlpha
-    if kernel["ProblemType"]["UseBeta"]:
-      self.defineSgpr("Beta", numSgprBeta, numSgprBeta)
-      self.states.numSgprBeta = numSgprBeta
-
+    # StreamK args
     if kernel["StreamK"] == 4:
       self.defineSgpr("ItersPerTile", 1)
       self.defineSgpr("TotalItems", 1)
@@ -9245,6 +9225,30 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.defineSgpr("skGrid", 1)
         self.defineSgpr("skTiles", 1)
         self.states.numSgprStreamK += 2
+
+    # D/C output buffers
+    self.defineSgpr("AddressD", numSgprAddressD)
+    self.defineSgpr("AddressC", numSgprAddressC)
+
+    # C/D strides
+    self.defineSgpr("StridesD", self.states.d.numSgprStrides)
+    self.defineSgpr("StridesC", self.states.c.numSgprStrides)
+
+    # for packed batches without stride restrictions need to do something different here
+    assert sorted(kernel["PackedC0IdxChars"]+kernel["PackedC1IdxChars"]) == \
+           sorted(set(kernel["PackedC0IdxChars"]+kernel["PackedC1IdxChars"]))
+    for idxChar in kernel["PackedC0IdxChars"][:-1]:
+      self.defineSgpr("MagicNumberSize%s"%idxChar, 1)
+      self.defineSgpr("MagicShiftSize%s"%idxChar, 1)
+    for idxChar in kernel["PackedC1IdxChars"][:-1]:
+      self.defineSgpr("MagicNumberSize%s"%idxChar, 1)
+      self.defineSgpr("MagicShiftSize%s"%idxChar, 1)
+
+    self.defineSgpr("Alpha", numSgprAlpha, numSgprAlpha)
+    self.states.numSgprAlpha = numSgprAlpha
+    if kernel["ProblemType"]["UseBeta"]:
+      self.defineSgpr("Beta", numSgprBeta, numSgprBeta)
+      self.states.numSgprBeta = numSgprBeta
 
     if not kernel["UseSubtileImpl"]:
       if kernel["LocalWriteUseSgprA"]:
