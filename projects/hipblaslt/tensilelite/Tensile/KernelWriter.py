@@ -5327,8 +5327,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
     initCIterWmma = bool(kernel["InitCIterWmma"])
 
     if self.states.numSgprPreload > 0:
-      # waitForArgsToLoad()
-      module.add(SWaitCnt(kmcnt=0, comment="wait for kern args!!!"))
+      if self.states.numSgprPreload >= (self.sgprs["Alpha"] - self.sgprs["SizesFree"]):
+        # waitForArgsToLoad()
+        module.add(SWaitCnt(kmcnt=0, comment="wait for kern args!!!"))
 
     if kernel["PrefetchGlobalRead"]:
       if self.states.doShadowInit:
