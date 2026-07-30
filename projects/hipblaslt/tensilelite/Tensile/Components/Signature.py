@@ -183,6 +183,12 @@ class SignatureDefault(Signature):
         if kernel["ProblemType"]["Sparse"]:
             signature.addArg("MetaData", SVK.SIG_GLOBALBUFFER, "void" , "generic")
 
+        # Note: We use packed f16 if alpha and beta are f16
+        pack_cptValueType = 'pkf16' if kernel["ProblemType"]["ComputeDataType"].isHalf() else cptValueType
+        signature.addArg(   "alpha",        SVK.SIG_VALUE, pack_cptValueType)
+        if kernel["ProblemType"]["UseBeta"]:
+            signature.addArg("beta",        SVK.SIG_VALUE, pack_cptValueType)
+
         # StreamK workspace + flags
         if kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0:
             signature.addArg("AddressWS", SVK.SIG_GLOBALBUFFER, cptValueType, "generic")
@@ -250,11 +256,6 @@ class SignatureDefault(Signature):
             signature.addArg("MagicNumberSize%s"%idxChar, SVK.SIG_VALUE,               "u32")
             signature.addArg( "MagicShiftSize%s"%idxChar, SVK.SIG_VALUE,               "u32")
 
-        # Note: We use packed f16 if alpha and beta are f16
-        pack_cptValueType = 'pkf16' if kernel["ProblemType"]["ComputeDataType"].isHalf() else cptValueType
-        signature.addArg(   "alpha",        SVK.SIG_VALUE, pack_cptValueType)
-        if kernel["ProblemType"]["UseBeta"]:
-            signature.addArg("beta",        SVK.SIG_VALUE, pack_cptValueType)
         # These are fixed sizes
         userArgumentsInfo.gemmArgumentSize += userArgumentsInfo.alphaMaxSize
         userArgumentsInfo.gemmArgumentSize += userArgumentsInfo.betaMaxSize

@@ -9188,6 +9188,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("AddressFlags", numSgprAddressFlags)
       self.states.numSgprStreamK += numSgprAddressWS + numSgprAddressFlags
 
+    self.defineSgpr("Alpha", numSgprAlpha, numSgprAlpha)
+    self.states.numSgprAlpha = numSgprAlpha
+    if kernel["ProblemType"]["UseBeta"]:
+      self.defineSgpr("Beta", numSgprBeta, numSgprBeta)
+      self.states.numSgprBeta = numSgprBeta
+
     # StreamK args
     if kernel["StreamK"] == 4:
       self.defineSgpr("ItersPerTile", 1)
@@ -9243,12 +9249,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     for idxChar in kernel["PackedC1IdxChars"][:-1]:
       self.defineSgpr("MagicNumberSize%s"%idxChar, 1)
       self.defineSgpr("MagicShiftSize%s"%idxChar, 1)
-
-    self.defineSgpr("Alpha", numSgprAlpha, numSgprAlpha)
-    self.states.numSgprAlpha = numSgprAlpha
-    if kernel["ProblemType"]["UseBeta"]:
-      self.defineSgpr("Beta", numSgprBeta, numSgprBeta)
-      self.states.numSgprBeta = numSgprBeta
 
     if not kernel["UseSubtileImpl"]:
       if kernel["LocalWriteUseSgprA"]:
