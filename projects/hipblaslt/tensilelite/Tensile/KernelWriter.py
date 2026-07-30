@@ -9188,12 +9188,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("AddressFlags", numSgprAddressFlags)
       self.states.numSgprStreamK += numSgprAddressWS + numSgprAddressFlags
 
-    self.defineSgpr("Alpha", numSgprAlpha, numSgprAlpha)
-    self.states.numSgprAlpha = numSgprAlpha
-    if kernel["ProblemType"]["UseBeta"]:
-      self.defineSgpr("Beta", numSgprBeta, numSgprBeta)
-      self.states.numSgprBeta = numSgprBeta
-
     # StreamK args
     if kernel["StreamK"] == 4:
       self.defineSgpr("ItersPerTile", 1)
@@ -9231,6 +9225,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.defineSgpr("skGrid", 1)
         self.defineSgpr("skTiles", 1)
         self.states.numSgprStreamK += 2
+
+    self.defineSgpr("Alpha", numSgprAlpha, numSgprAlpha)
+    self.states.numSgprAlpha = numSgprAlpha
+    if kernel["ProblemType"]["UseBeta"]:
+      self.defineSgpr("Beta", numSgprBeta, numSgprBeta)
+      self.states.numSgprBeta = numSgprBeta
 
     # D/C output buffers
     self.defineSgpr("AddressD", numSgprAddressD)

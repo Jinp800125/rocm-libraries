@@ -645,19 +645,6 @@ namespace TensileLite
                 args.template append<void*>("Flags", inputs.Synchronizer);
         }
 
-        args.append("alpha", inputs.alpha, problem.alphaType());
-
-        if(problem.alphaType() == rocisa::DataType::Half)
-            args.append("alpha_2", inputs.alpha, problem.alphaType());
-
-        if(problemType.useBeta)
-        {
-            args.append("beta", inputs.beta, problem.betaType());
-
-            if(problem.betaType() == rocisa::DataType::Half)
-                args.append("beta_2", inputs.beta, problem.betaType());
-        }
-
         // Additional check for General Batched GEMM until GSU and StreamK are supported
         // in General Batched GEMM
         if(sizeMapping.streamK != 0)
@@ -876,6 +863,19 @@ namespace TensileLite
                     }
                 }
             }
+        }
+
+        args.append("alpha", inputs.alpha, problem.alphaType());
+
+        if(problem.alphaType() == rocisa::DataType::Half)
+            args.append("alpha_2", inputs.alpha, problem.alphaType());
+
+        if(problemType.useBeta)
+        {
+            args.append("beta", inputs.beta, problem.betaType());
+
+            if(problem.betaType() == rocisa::DataType::Half)
+                args.append("beta_2", inputs.beta, problem.betaType());
         }
 
         bool singleWSD = false;
