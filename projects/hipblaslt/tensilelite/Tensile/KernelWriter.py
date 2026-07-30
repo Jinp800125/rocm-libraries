@@ -5293,6 +5293,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # gfx1250 moves SK constants to VGPRs inside defineAndResources so the
     # freed SGPR slots can be reused before defineVariableSgprs runs.
 
+    # if self.states.numSgprPreload > 0:
+    #   # waitForArgsToLoad()
+    #   module.add(SWaitCnt(kmcnt=0, comment="wait for kern args!!!"))
+
     # Initialize stream-k loop
     skComponent = Component.StreamK.find(self)
     module.add(skComponent.preLoop(self, kernel))
@@ -5307,7 +5311,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     loopComponent = Component.PersistentLoop.find(self)
 
     module.add(loopComponent.openPersistentLoop(self, kernel))
+    module.add(SNop(waitState=0, comment="setupNewTile start!!!"))
     module.add(self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isOptNLL=False))
+    module.add(SNop(waitState=0, comment="setupNewTile end!!!"))
+    # module.add(loopComponent.openPersistentLoop(self, kernel))
 
     if self.do["executeToPrefetchEnd"]:
       module.add(self.functionEnd(kernel, addLabel=False))
@@ -5318,6 +5325,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     # InitCIterWmma is resolved to 0/1 in SolutionStructs/Solution.py (-1 auto path).
     initCIterWmma = bool(kernel["InitCIterWmma"])
+
+    if self.states.numSgprPreload > 0:
+      # waitForArgsToLoad()
+      module.add(SWaitCnt(kmcnt=0, comment="wait for kern args!!!"))
 
     if kernel["PrefetchGlobalRead"]:
       if self.states.doShadowInit:

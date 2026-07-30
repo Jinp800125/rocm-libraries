@@ -2773,7 +2773,7 @@ class KernelWriterAssembly(KernelWriter):
 
       if self.states.numSgprPreload > 0:
         calculateWG()
-        waitForArgsToLoad()
+        # waitForArgsToLoad()
       else:
         waitForArgsToLoad()
         calculateWG()
@@ -3033,6 +3033,9 @@ class KernelWriterAssembly(KernelWriter):
     # gfx1250 moves SK constants to VGPRs and fully frees their SGPR slots
     # before defineVariableSgprs so those slots can be reused.
     if kernel["StreamK"] and self.isStreamKConstantsToVgprEnabled(kernel):
+      if self.states.numSgprPreload > 0:
+        # waitForArgsToLoad()
+        module.add(SWaitCnt(kmcnt=0, comment="wait for kern args!!!"))
       module.add(self.moveStreamKConstantsToVgpr(kernel))
 
     # define the rest of sgprs
