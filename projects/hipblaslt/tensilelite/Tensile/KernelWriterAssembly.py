@@ -15761,7 +15761,13 @@ class KernelWriterAssembly(KernelWriter):
     if (srcType.isHalf() or srcType.isBFloat16() or subtileImplDest16b):
       # only do an even number of halves - since these share hi/lo pieces of some registers?
       if numElementsPerBatch > 1:
-        numElementsPerBatch = int(numElementsPerBatch/2)*2
+        # The packed f32 epilogue ops (v_pk_mul/add_f32) process 2 consecutive
+        # ValuC per instruction, so a batch's total ValuC (numElementsPerBatch*gwvw)
+        # must be even. When gwvw is already even this holds for ANY
+        # numElementsPerBatch, so only force even when gwvw is odd (e.g. gwvw==1).
+        # (Subtile 16b keeps the stricter even+pair alignment below.)
+        if (gwvw % 2) == 1 or kernel.get("UseSubtileImpl"):
+          numElementsPerBatch = int(numElementsPerBatch/2)*2
         # UseSubtileImpl paired-store: batch must be aligned to MIWaveTile[0]
         # (the number of M-tiles per N-column) so that batch boundaries don't
         # split sba=0/sba=1 pairs within an N-column.
