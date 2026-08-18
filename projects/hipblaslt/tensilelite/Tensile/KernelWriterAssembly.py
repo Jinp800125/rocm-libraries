@@ -15386,7 +15386,9 @@ class KernelWriterAssembly(KernelWriter):
         with self.allocTmpSgpr(1, tag="globalWriteElements_tmpSgprGSU") as tmpSgprGSU:
           module.add(SAndB32(dst=sgpr(tmpSgprGSU.idx), src0=sgpr("GSU"), src1=self.gsuMaskHex(kernel), comment="Restore GSU"))
           module.add(SCmpEQU32(src0=sgpr(tmpSgprGSU.idx), src1=1, comment="GSU == 1 ?"))
-        if (kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel" or kernel["AdaptiveGemmGSUA"] == 1):
+        # SRVW epilogue 也可能超過 simm16，跟 MBSK 一樣走 longBranch。
+        # SRVW epilogue can also exceed simm16, so use longBranch like MBSK.
+        if (kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel" or kernel["AdaptiveGemmGSUA"] == 1 or kernel["StoreRemapVectorWidth"]):
           module.add(self.longBranchScc1(label=gsuLabel, posNeg=1, comment="long branch if GSU == 1"))
         else:
           module.add(SCBranchSCC1(labelName=gsuLabel.getLabelName(), comment="branch if GSU == 1"))
