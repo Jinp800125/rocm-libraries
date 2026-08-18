@@ -478,7 +478,9 @@ class GlobalWriteBatchWriter:
       if clsLabel is not None and (self._computeBatchesPerCLSBody() - 1 == self.batchIdx) and self.ss.elementAddr:
         module.add(SSubI32(dst=sgpr("CLSLoopCounter"), src0=sgpr("CLSLoopCounter"), src1=1))
         module.add(SCmpEQU32(src0=sgpr("CLSLoopCounter"), src1=0))
-        module.add(SCBranchSCC0(clsLabel.getLabelName(), "loop while counter != 0"))
+        # CLS body 可能超過 simm16，用 32-bit longBranch 跳回。
+        # CLS body can exceed simm16; use a 32-bit longBranch back-edge.
+        module.add(self.parentWriter.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
         # if not self.kernel["StreamK"] == 3:
         #   module.add(SEndpgm(comment="stop here after CLS loop"))
         self.ss._clsLoopLabel = None
