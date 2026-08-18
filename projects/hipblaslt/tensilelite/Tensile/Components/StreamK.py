@@ -1560,6 +1560,14 @@ class StreamK(Component):
         #     firstRow = [e for e in elements[edgeI] if e[0]==0 and e[2]==0]
         #     numElementsPerBatch=min(len(firstRow),numElementsPerBatch)
 
+        # CompactLoopStore: 把 batch 對齊整組 N-group，讓後面 CLS 能 compact。
+        # CompactLoopStore: align batch size to a whole N-group so the CLS loop can compact.
+        numElementsPerBatchPreCLS = numElementsPerBatch
+        # DEBUG：`if 1:` 永遠跑 align；應改回 `if kernel["CompactLoopStore"]:`（inner 已自己 guard）。
+        # DEBUG: `if 1:` always runs align; should be `if kernel["CompactLoopStore"]:` (inner already guards).
+        if 1:# kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
+            numElementsPerBatch = self._skAlignNEPBForCLS(kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
+
         numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
 
         numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
@@ -1586,18 +1594,53 @@ class StreamK(Component):
             if useCodeMulAlpha: # do not set codeAccVgprRead=None if GSU>1
                 codeAccVgprRead = None
 
-            for batchIdx in range(0, numBatches):
-                elementStartIdx = batchIdx * numElementsPerBatch
-                elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
-                # elementVgprs can be large and should be perfectly tuned to the number of available
-                # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+            # CompactLoopStore: 把多個 WS store batch 收成一份 body + countdown。
+            # CompactLoopStore: fold per-batch WS stores into one reused body + countdown.
+            # edge / iterCount<=1 / 沒有 accVgprRead：維持原本完全展開。
+            # Fall back to fully unrolled emit on edge / iterCount<=1 / no accVgprRead.
+            from .GlobalWriteBatch import GlobalWriteBatchWriter
+            # WS 是線性 soffset，不受 clsMaxNIter 限制；flatWorkspaceWalk 讓 (B) 選最大 iterCount（含 SS=0）。
+            # Linear WS soffset, not bound by clsMaxNIter; flatWorkspaceWalk lets (B) pick the largest iterCount (incl. SS=0).
+            clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw, flatWorkspaceWalk=True)
+            useCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
+                and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
 
-                module.add(self.partialsWriteBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, gwvw, atomicW, \
-                        elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
-                        tmpVgpr, cvtVgprStruct, \
-                        elementSgprs, tmpSgpr, codeAccVgprRead))
+            if useCLS:
+                # DEBUG：SK CLS layout / NEPB 調整會寫進 .s。
+                # DEBUG: SK CLS layout / NEPB adjustment dumped into .s.
+                from ..KernelWriterModules import getAccToArchLen
+                module.addComment0("SK CLS clsMaxNIter=%u" % GlobalWriteBatchWriter.clsMaxNIter(kernel))
+                module.addComment0("SK CLS totalAccRegs=%u" % getAccToArchLen(kernel))
+                module.addComment0("SK CLS auto-adjust: numElementsPerBatch %u -> %u, numBatches=%u" %
+                    (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
+                module.addComment0("SK CLS layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
+                    (clsBPB, clsIter, clsM0Step))
+                module.addComment0("SK CLS clsdbg len(elements)=%u gwvw=%u numVgprsPerElement=%s sgprLimNEPB=%s NEPBS=%s" % (
+                    len(elements[edgeI]), gwvw, str(ss.numVgprsPerElement),
+                    str(getattr(ss.cfg, "numElementsPerBatchLimitedBySgprs", "?")),
+                    str(kernel["NumElementsPerBatchStore"])))
+                elementsEdge = elements[edgeI]
+                def _emitPartialsBatch(bIdx):
+                    _start = bIdx * numElementsPerBatch
+                    _stop  = min(_start + numElementsPerBatch, len(elementsEdge))
+                    return self.partialsWriteBatch(writer, kernel, ss, bIdx, alpha, beta, edge, gwvw, atomicW, \
+                        elementsEdge[_start:_stop], writer.vgprs.addrD, writer.vgprs.addrC, \
+                        tmpVgpr, cvtVgprStruct, elementSgprs, tmpSgpr, codeAccVgprRead, clsLoop=True)
+                module.add(self._skEmitCLSBatchLoop(writer, kernel, tmpSgpr, clsIter, clsBPB, clsM0Step,
+                        self._skWsOffsetIncrement(writer, kernel), "SK_Partials_CLS", _emitPartialsBatch))
+            else:
+                for batchIdx in range(0, numBatches):
+                    elementStartIdx = batchIdx * numElementsPerBatch
+                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
+                    elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
+                    #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
+                    # elementVgprs can be large and should be perfectly tuned to the number of available
+                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+
+                    module.add(self.partialsWriteBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, gwvw, atomicW, \
+                            elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
+                            tmpVgpr, cvtVgprStruct, \
+                            elementSgprs, tmpSgpr, codeAccVgprRead))
             # delay PreLoopVmcntCase code after globalWrite
             # if self.canOptimizePreLoopLWVmcnt:
             #     kStr += PreLoopVmcntCaseStr
@@ -1717,9 +1760,73 @@ class StreamK(Component):
 
         return module
 
+    def _skWsOffsetIncrement(self, writer, kernel):
+        """WS 每 element 的 byte stride（給 CLS preamble `offset = -inc`）。
+        Per-element byte stride of the flat Stream-K workspace (CLS preamble sets `offset = -inc`).
+        """
+        if kernel["EnableMatrixInstruction"]:
+            waveNum = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1] * kernel["WorkGroup"][2]
+        else:
+            waveNum = kernel["NumThreads"] // kernel["WavefrontSize"]
+        return (kernel["WavefrontSize"] * waveNum) * kernel["StoreVectorWidth"] * writer.states.bpeCinternal
+
+    def _skAlignNEPBForCLS(self, kernel, nElem, numElementsPerBatch, gwvw, edge):
+        """把 NEPB 收到能整除 N-group 的最大 cand（不超出原 VGPR budget）。
+        Shrink NEPB to the largest N-group divisor that still fits the existing VGPR budget.
+        """
+        if not (kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not edge):
+            return numElementsPerBatch
+        from .GlobalWriteBatch import GlobalWriteBatchWriter
+        maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
+        if maxNIter <= 1 or nElem % maxNIter != 0:
+            return numElementsPerBatch
+        elemsPerNGroup = nElem // maxNIter
+        # half/bf16 pack two elements per 32b register, so a batch must be even
+        # unless gwvw already makes the ValuC count even.
+        cdt = kernel["ProblemType"]["ComputeDataType"]
+        needsEven = (cdt.isHalf() or cdt.isBFloat16()) and ((gwvw % 2) == 1)
+        budget = min(elemsPerNGroup, max(1, numElementsPerBatch))
+        for cand in range(budget, 0, -1):
+            if elemsPerNGroup % cand != 0:
+                continue
+            if needsEven and cand > 1 and (cand % 2) != 0:
+                continue
+            return cand
+        return numElementsPerBatch
+
+    def _skEmitCLSBatchLoop(self, writer, kernel, tmpS01, iterCount, batchesPerBody,
+                            m0Step, increment, labelBase, emitBatch):
+        """SK CLS countdown：一份 body 重跑 iterCount 次。M0 每次 +m0Step；WS offset 跨 iteration 接著加。
+        SK CLS countdown: reuse one body iterCount times. M0 += m0Step each iter; WS offset keeps incrementing.
+        """
+        module = Module("StreamK CLS batch loop")
+        clsCounter = writer.sgprPool.checkOut(1, tag="SKCLSLoopCounter", preventOverflow=False)
+        clsM0Base  = writer.sgprPool.checkOut(1, tag="SKCLSm0Base", preventOverflow=False)
+        module.add(SMovB32(dst=sgpr(clsM0Base), src=0, comment="SK CLS M0 base = 0"))
+        module.add(SMovB32(dst=sgpr(clsCounter), src=iterCount, comment="SK CLS loop iter count = %u" % iterCount))
+        # preamble 設 offset=-inc，body 第一個 element 先 +inc 才落到 0。
+        # Prime offset=-inc so the body's first per-element add lands on 0.
+        module.add(SMovB32(dst=sgpr(tmpS01), src=hex((-increment) & 0xFFFFFFFF),
+                           comment="Init sgpr offset = -inc (body adds inc first)"))
+        clsLabel = Label(writer.labels.getNameInc(labelBase), "")
+        module.add(clsLabel)
+        module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0Base),
+                           comment="SK CLS M0 = base (v_movrelsd src/dst offset)"))
+        module.add(SAddU32(dst=sgpr(clsM0Base), src0=sgpr(clsM0Base), src1=m0Step,
+                           comment="SK CLS M0 step (src coef of CLS iter dim)"))
+        for batchIdx in range(0, batchesPerBody):
+            module.add(emitBatch(batchIdx))
+        module.add(SSubU32(dst=sgpr(clsCounter), src0=sgpr(clsCounter), src1=1, comment="SK CLS countdown"))
+        module.add(SCmpEQU32(src0=sgpr(clsCounter), src1=0, comment="CLS loop done?"))
+        # 32-bit backward branch: the CLS body can exceed simm16 for large tiles.
+        module.add(writer.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
+        writer.sgprPool.checkIn(clsM0Base)
+        writer.sgprPool.checkIn(clsCounter)
+        return module
+
     def partialsWriteBatch(self, writer, kernel, ss, batchIdx, applyAlpha, beta, edge, gwvw, atomicW, \
             batchElements, addrD, addrC, \
-            tmpVgpr, cvtVgprStruct, batchElementSgprs, tmpSgpr, codeAccVgprRead):
+            tmpVgpr, cvtVgprStruct, batchElementSgprs, tmpSgpr, codeAccVgprRead, clsLoop=False):
         module = Module("StreamK Common partialsWriteBatch")
 
         module.addComment0("optSingleColVgpr=%u optSharedColVgpr=%u optSGPRUsage=%s optSrdIncForRow=%u" % \
@@ -1784,7 +1891,9 @@ class StreamK(Component):
             # VGPR index gets a random offset and the partials wrote into D
             # come out scrambled. Force M0=0 here so v_movrelsd_2_b32 behaves
             # like the plain v_mov_b32 the non-CLS path used to emit.
-            if kernel.get("CompactLoopStore", False):
+            # clsLoop：M0 由 loop header 驅動，這裡不可 reset。
+            # clsLoop: M0 is driven by the enclosing CLS loop header — do not reset here.
+            if kernel.get("CompactLoopStore", False) and not clsLoop:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
@@ -1873,13 +1982,19 @@ class StreamK(Component):
                 sumIdx = ss.elementSumIdx[elementIdx]
             storeWidth = gwvw  # pitch must match store/load width gwvw, not StoreVectorWidth (differ on source kernels)
             # storeWidth = 2
+            increment = (kernel["WavefrontSize"] * WaveNum) * storeWidth * writer.states.bpeCinternal
             if batchIdx == 0 and elementIdx == 0:
-                tmpSgprRes = ContinuousRegister(idx=tmpS01, size=1)
+                # clsLoop：乘法 scratch 用 tmpS01+1，勿蓋掉 preamble 的 WS offset。第一筆改 +inc 而不是 init 0。
+                # clsLoop: multiply scratch is tmpS01+1 so the primed WS offset is preserved. First elt adds inc instead of init 0.
+                scratchIdx = (tmpS01 + 1) if clsLoop else tmpS01
+                tmpSgprRes = ContinuousRegister(idx=scratchIdx, size=1)
                 module.add(vectorStaticMultiply(vgpr(addr), vgpr("Serial"), storeWidth * writer.states.bpeCinternal, tmpSgprRes))
                 # kStr += inst("v_mul_lo_u32", , "Partials buffer address")
-                module.add(SMovB32(dst=sgpr(tmpS01), src=0, comment="Init sgpr offset"))
+                if clsLoop:
+                    module.add(SAddU32(dst=sgpr(tmpS01), src0=sgpr(tmpS01), src1=increment, comment="Inc sgpr offset"))
+                else:
+                    module.add(SMovB32(dst=sgpr(tmpS01), src=0, comment="Init sgpr offset"))
             else:
-                increment = (kernel["WavefrontSize"] * WaveNum) * storeWidth * writer.states.bpeCinternal
                 # module.addComment1("WavefrontSize={}, WaveNum={}, storeWidth={}, bpeC={}".format(kernel["WavefrontSize"], WaveNum, storeWidth, writer.states.bpeCinternal))
                 module.add(SAddU32(dst=sgpr(tmpS01), src0=sgpr(tmpS01), src1=increment, comment="Inc sgpr offset"))
 
@@ -2116,6 +2231,15 @@ class StreamK(Component):
             #    numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
             #    #print "    NumVectorsPerBatch", numVectorsPerBatch
             #    numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
+            # CompactLoopStore: align the batch size to a whole N-group so the
+            # batches split the tile evenly and the CLS loop below can compact
+            # them (mirrors partialsWriteProcedure). Keep the pre-align value for
+            # the CLS debug banner.
+            numElementsPerBatchPreCLS = numElementsPerBatch
+            # DEBUG：`if 1:` 永遠跑 align。即使 NEPBS 有設也要 shrink，否則 pinned NEPBS 常常不能整除、CLS 開不起來。
+            # DEBUG: `if 1:` always runs align. Shrink even when NEPBS is set, else a pinned NEPBS often does not divide and CLS cannot loop.
+            if 1:# kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
+                numElementsPerBatch = self._skAlignNEPBForCLS(kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
             numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
 
             numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
@@ -2141,19 +2265,50 @@ class StreamK(Component):
 
                 module.add(self.computeWorkspaceSrd(writer, kernel, sgpr(sPartialIdx), tmpSgpr))
 
-                for batchIdx in range(0, numBatches):
-                    elementStartIdx = batchIdx * numElementsPerBatch
-                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                    elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                    #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
-                    # elementVgprs can be large and should be perfectly tuned to the number of available
-                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                # CompactLoopStore: 把 fixup（load / acc / write-back）收成一份 countdown。
+                # CompactLoopStore: fold fixup (load / acc / write-back) into one countdown.
+                # accVgprRead 吃 M0[9:0]；accVgprWrite 吃 M0[25:16]（clsLoop 中間要 shift）。
+                # accVgprRead uses M0[9:0]; accVgprWrite uses M0[25:16] (shift between them in clsLoop).
+                from .GlobalWriteBatch import GlobalWriteBatchWriter
+                # fixup 的 WS 也是線性 soffset；strided D-store 另走 clsMaxNIter。
+                # Fixup WS is also a linear soffset; the strided D-store still uses clsMaxNIter.
+                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw, flatWorkspaceWalk=True)
+                useCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
+                    and codeAccVgprRead is not None and codeAccVgprWrite is not None \
+                    and kernel["LocalSplitU"] == 1 and not edge
 
-                    module.add(self.fixupBatch(writer, kernel, ss, batchIdx, edge, gwvw, \
-                            elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
-                            tmpVgpr, cvtVgprStruct, \
-                            elementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite,
-                            elementStartIdx))
+                if useCLS:
+                    from ..KernelWriterModules import getAccToArchLen
+                    module.addComment0("SK CLS (fixup) clsMaxNIter=%u" % GlobalWriteBatchWriter.clsMaxNIter(kernel))
+                    module.addComment0("SK CLS (fixup) totalAccRegs=%u" % getAccToArchLen(kernel))
+                    module.addComment0("SK CLS (fixup) auto-adjust: numElementsPerBatch %u -> %u, numBatches=%u" %
+                        (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
+                    module.addComment0("SK CLS (fixup) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
+                        (clsBPB, clsIter, clsM0Step))
+                    elementsEdge = elements[edgeI]
+                    def _emitFixupBatch(bIdx):
+                        _start = bIdx * numElementsPerBatch
+                        _stop  = min(_start + numElementsPerBatch, len(elementsEdge))
+                        return self.fixupBatch(writer, kernel, ss, bIdx, edge, gwvw, \
+                            elementsEdge[_start:_stop], writer.vgprs.addrD, writer.vgprs.addrC, \
+                            tmpVgpr, cvtVgprStruct, elementSgprs, tmpSgpr, \
+                            codeAccVgprRead, codeAccVgprWrite, _start, clsLoop=True)
+                    module.add(self._skEmitCLSBatchLoop(writer, kernel, tmpSgpr, clsIter, clsBPB, clsM0Step,
+                            self._skWsOffsetIncrement(writer, kernel), "SK_Fixup_CLS", _emitFixupBatch))
+                else:
+                    for batchIdx in range(0, numBatches):
+                        elementStartIdx = batchIdx * numElementsPerBatch
+                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
+                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
+                        #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
+                        # elementVgprs can be large and should be perfectly tuned to the number of available
+                        # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+
+                        module.add(self.fixupBatch(writer, kernel, ss, batchIdx, edge, gwvw, \
+                                elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
+                                tmpVgpr, cvtVgprStruct, \
+                                elementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite,
+                                elementStartIdx))
                 # delay PreLoopVmcntCase code after globalWrite
                 # if self.canOptimizePreLoopLWVmcnt:
                 #     kStr += PreLoopVmcntCaseStr
@@ -2168,7 +2323,7 @@ class StreamK(Component):
     def fixupBatch(self, writer, kernel, ss, batchIdx, edge, gwvw, \
             batchElements, addrD, addrC, \
             tmpVgpr, cvtVgprStruct, batchElementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite,
-            elementStartIdx=0):
+            elementStartIdx=0, clsLoop=False):
         module = Module("StreamK Common fixupBatch")
 
         module.addComment0("optSingleColVgpr=%u optSharedColVgpr=%u optSGPRUsage=%s optSrdIncForRow=%u" % \
@@ -2255,13 +2410,19 @@ class StreamK(Component):
 
             storeWidth = gwvw  # pitch must match store/load width gwvw, not StoreVectorWidth (differ on source kernels)
             # storeWidth = 2
+            increment = (kernel["WavefrontSize"] * WaveNum) * storeWidth * writer.states.bpeCinternal
             if batchIdx == 0 and elementIdx == 0:
-                tmpS01Res = ContinuousRegister(idx=tmpS01, size=1)
+                # clsLoop：乘法 scratch 用 tmpS01+1，勿蓋掉 preamble 的 WS offset。第一筆改 +inc 而不是 init 0。
+                # clsLoop: multiply scratch is tmpS01+1 so the primed WS offset is preserved. First elt adds inc instead of init 0.
+                scratchIdx = (tmpS01 + 1) if clsLoop else tmpS01
+                tmpS01Res = ContinuousRegister(idx=scratchIdx, size=1)
                 module.add(vectorStaticMultiply(vgpr(addrCVgpr), vgpr("Serial"), storeWidth * writer.states.bpeCinternal, tmpS01Res))
                 # kStr += inst("v_mul_lo_u32", , "Partials buffer address")
-                module.add(SMovB32(dst=sgpr(tmpS01), src=0, comment="Init sgpr offset"))
+                if clsLoop:
+                    module.add(SAddU32(dst=sgpr(tmpS01), src0=sgpr(tmpS01), src1=increment, comment="Inc sgpr offset"))
+                else:
+                    module.add(SMovB32(dst=sgpr(tmpS01), src=0, comment="Init sgpr offset"))
             else:
-                increment = (kernel["WavefrontSize"] * WaveNum) * storeWidth * writer.states.bpeCinternal
                 # module.addComment1("WavefrontSize={}, WaveNum={}, storeWidth={}, bpeC={}".format(kernel["WavefrontSize"], WaveNum, storeWidth, writer.states.bpeCinternal))
                 module.add(SAddU32(dst=sgpr(tmpS01), src0=sgpr(tmpS01), src1=increment, comment="Inc sgpr offset"))
 
@@ -2277,7 +2438,10 @@ class StreamK(Component):
             # the CLS loop has left M0 = sgprWorkGroup2+step. accVgprRead is the
             # precomputed v_movrelsd_2_b32 module (when CompactLoopStore=True),
             # which would pick up that stale M0 and reorder accumulator vregs.
-            if kernel.get("CompactLoopStore", False):
+            # clsLoop: M0 is driven by the enclosing CLS loop header (M0[9:0] =
+            # base), which the read consumes to offset the accumulator src, so do
+            # NOT reset it here.
+            if kernel.get("CompactLoopStore", False) and not clsLoop:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
@@ -2496,6 +2660,15 @@ class StreamK(Component):
         # if kernel.enabledSetPrioSplitLDS:
         #     kStr += inst("s_setprio", "0", "")
         if codeAccVgprWrite is not None and kernel["LocalSplitU"] == 1:
+            # CLS write-back：把 M0[9:0]（read 用）搬到 M0[25:16]（write dst）；vreg src 維持 0。
+            # CLS write-back: move M0[9:0] (read) up to M0[25:16] (write dst); keep vreg src at 0.
+            if kernel.get("CompactLoopStore", False):
+                if clsLoop:
+                    module.add(SLShiftLeftB32(dst=mgpr(0), src=mgpr(0), shiftHex=16,
+                        comment="M0[9:0] -> M0[25:16]: drive v_movrelsd_2_b32 dst (acc) index"))
+                else:
+                    module.add(SMovB32(dst=mgpr(0), src=0,
+                        comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
             # loop over store instructions within one batch
             for elementIdx in range(0, len(batchElements)):
@@ -2509,6 +2682,12 @@ class StreamK(Component):
                         # if kernel["StoreCInUnroll"] and not edge:
                         #     tempStr = tempStr.replace("__placeholder__",str(elementIdx*gwvw*regsPerScalar + regsPerScalar*vi + rIdx))
                         #     accVgprRead.addCode(tempStr.replace("ValuC","L2GC"))
+
+            # clsLoop：body 若有多個 batch，下一個 accVgprRead 還要吃 M0[9:0]，這裡要把 shift 還原。
+            # clsLoop: if the body has more than one batch, the next accVgprRead still needs M0[9:0] — restore the shift.
+            if kernel.get("CompactLoopStore", False) and clsLoop:
+                module.add(SLShiftRightB32(dst=mgpr(0), src=mgpr(0), shiftHex=16,
+                    comment="M0[25:16] -> M0[9:0]: restore acc src index for next batch's read"))
 
             if not kernel["MIArchVgpr"]:
                 module.add(SNop(1, "2 wait states required before reading vgpr"))

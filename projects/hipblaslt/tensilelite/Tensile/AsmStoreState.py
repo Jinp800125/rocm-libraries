@@ -83,7 +83,11 @@ class StoreState:
             if ss.optSGPRUsage == 'BufferLoad_Mask':
                 self.numMaskSgprPerElement = 0
                 self.numMaskSgprPerBatch   = 0
-                self.numTempSgprPerBatch = (2 if getattr(kernelWriter.states, 'storeAlign8', False) else 1) * kernelWriter.states.laneSGPRCount
+                # 必須看 kernel["CompactLoopStore"]：getattr(states,...) 永遠是 False。
+                # Must use kernel["CompactLoopStore"]: getattr(states, ...) is always False.
+                # CLS/align8 多一個 lane-mask slot，exec mask 不可佔 tmpS01（row-inc primer）。
+                # Extra lane-mask slot so exec mask cannot clobber tmpS01 (row-inc primer).
+                self.numTempSgprPerBatch = (2 if getattr(kernelWriter.states, 'storeAlign8', False) or kernel["CompactLoopStore"] else 1) * kernelWriter.states.laneSGPRCount
             elif ss.optSGPRUsage == 'BufferLoad_Edge_Mask':
                 self.numMaskSgprPerElement = 0
                 self.numMaskSgprPerBatch   = kernelWriter.states.laneSGPRCount

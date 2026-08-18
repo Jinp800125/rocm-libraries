@@ -16233,6 +16233,14 @@ class KernelWriterAssembly(KernelWriter):
       # where a smaller batch reduces register pressure or improves store pipelining).
       numElementsPerBatch = len(element)
 
+    # DEBUG：VGPR 允許的 raw NEPB（尚未被 NEPBS/SGPR/even cap），寫進 .s 對 cap 來源。
+    # DEBUG: raw VGPR-allowed NEPB (before NEPBS/SGPR/even caps), dumped into .s.
+    ss.cfg.dbgVgprAllowedNEPB = numElementsPerBatch
+
+    # DEBUG leftover：對 NEPB 來源。
+    # DEBUG leftover: traces where NEPB came from.
+    # print("numElementsPerBatch: ", numElementsPerBatch, numVgprAvailable, ss.numVgprsPerElement)
+
     # Cap batch size to align on MIWaveTile[0] (M-tile) boundaries.
     # The acc-to-VGPR mapping interleaves M and N tiles, so a batch that
     # partially covers an N-column still touches the full acc range of that
@@ -16311,6 +16319,41 @@ class KernelWriterAssembly(KernelWriter):
     #  numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
     #  #print "  NumVectorsPerBatch", numVectorsPerBatch
     #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
+
+    # CompactLoopStore: 把 batch 對齊最外層 N-group，讓 numBatches 是 maxNIter 的倍數才能 compact。
+    # CompactLoopStore: align batches to one outermost N-group so numBatches is a multiple of maxNIter.
+    # 預算 = min(VGPR-allowed, SGPR-limit)，刻意不理 NEPBS（迴圈共用 body，胖 batch 不降 occupancy）。
+    # Budget = min(VGPR-allowed, SGPR-limit); ignore NEPBS (reused body, fatter batch does not drop occupancy).
+    # 跳過 atomic / StoreRemap / subtile。
+    # Skip atomic / StoreRemap / subtile.
+    if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"] and kernel["EnableMatrixInstruction"] \
+        and not atomic and not kernel["StoreRemapVectorWidth"] and not kernel.get("UseSubtileImpl") \
+        and ss.numVgprsPerElement > 0:
+      maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
+      nElem = len(element)
+      if maxNIter > 1 and nElem % maxNIter == 0:
+        # 只擴已經 loop 不起來的 kernel，避免動到已經在 loop 的 batch size。
+        # Only re-align kernels whose natural batching does not already loop.
+        # #Victor 要確認是不是要把這個條件移除擴展到全部 (i.e. also re-align
+        #   already-looping kernels, not just the non-looping ones).
+        naturalNumBatches = max(1, ceilDivide(nElem, numElementsPerBatch))
+        _, _naturalIter, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, naturalNumBatches, numElementsPerBatch, gwvw)
+        if _naturalIter <= 1:
+          elemsPerNGroup = nElem // maxNIter
+          # occupancy-safe budget: VGPR-allowed (numVgprAvailable // numVgprsPerElement)
+          # capped by the SGPR limit; deliberately ignores NEPBS.
+          budget = numVgprAvailable // ss.numVgprsPerElement
+          sgprLim = ss.cfg.numElementsPerBatchLimitedBySgprs
+          if sgprLim and sgprLim > 0:
+            budget = min(budget, sgprLim)
+          budget = max(1, budget)
+          # largest divisor of one N-group that fits the budget (== elemsPerNGroup
+          # itself when it fits -> fattest batch, most compaction); min 1.
+          for cand in range(min(elemsPerNGroup, budget), 0, -1):
+            if elemsPerNGroup % cand == 0:
+              numElementsPerBatch = cand
+              break
+
     numBatches = max(1, ceilDivide(len(element),numElementsPerBatch))
 
     # Grow pool if needed
@@ -16512,7 +16555,9 @@ class KernelWriterAssembly(KernelWriter):
         # re-executed via the runtime loop.
         # For non-CLS, numBatchesCLS == numBatches so behaviour is unchanged.
         if kernel["CompactLoopStore"]:
-          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches)
+          # 發出的 body 長度必須跟 iterCount 用同一套 divisibility；否則 trim 了 body 卻 loop=1，尾端沒 store。
+          # Emission limit must use the same divisibility as iterCount; else body is trimmed while loop=1 and trailing batches are never stored.
+          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches, numElementsPerBatch, gwvw)
         else:
           numBatchesCLS = numBatches
 
@@ -16522,7 +16567,14 @@ class KernelWriterAssembly(KernelWriter):
         # scan in GlobalWriteBatchWriter falls through to this value when no
         # further intra-batch emit is found (= last emitting elt of the batch
         # needs the cross-batch advance). 0 for non-CLS / last batch / atomic.
+        # 兩個 look-ahead：邊界 delta vs 下一次「真的跨 row」。
+        # Two look-aheads: boundary delta vs the next real row crossing.
+        #   next_rowInc_per_batch : 剛好在 batch 邊界的 coord1 delta（切在 row 中間則為 0）。
+        #     coord1 delta AT the batch boundary (0 if the next batch starts mid-row).
+        #   next_firing_per_batch : 邊界後第一個非 0 的 row 跳（primer 要用這個，避免 stale 1）。
+        #     first non-zero row jump at/after the boundary (primer must use this, not a stale 1).
         next_rowInc_per_batch = [0] * numBatches
+        next_firing_per_batch = [0] * numBatches
         if kernel["CompactLoopStore"] and not atomic:
           # Use the single authoritative coordOffset1 formula in
           # getStoreElementsInfoForBatch (returns coord1 per element for the
@@ -16532,6 +16584,13 @@ class KernelWriterAssembly(KernelWriter):
             _elStopIdx = min((_bIdx + 1) * numElementsPerBatch, len(element))
             if _elStopIdx < len(element):
               next_rowInc_per_batch[_bIdx] = _coord1All[_elStopIdx] - _coord1All[_elStopIdx - 1]
+              # 往後掃到第一個非 0 delta = 真正的跨 row（給 primer）。
+              # Scan forward to the first non-zero delta = the real row jump (for the primer).
+              for _j in range(_elStopIdx, len(element)):
+                _d = _coord1All[_j] - _coord1All[_j - 1]
+                if _d != 0:
+                  next_firing_per_batch[_bIdx] = _d
+                  break
 
         for batchIdx in range(0, numBatchesCLS):
           elementStartIdx = batchIdx * numElementsPerBatch
@@ -16545,17 +16604,11 @@ class KernelWriterAssembly(KernelWriter):
             #Indication if this batch is last batch for this column block shape
             self.StoreRemapLastBatch = 1 if (batchIdx+1) % nBatchesPerRow == 0 else 0
 
-          # Look ahead through next_rowInc_per_batch for the first non-zero
-          # transition: SRVW path skips batches whose `addrCalc.rowInc == 0`,
-          # so the chain primer at the current batch primes for the NEXT
-          # firing consumer (= first batch with a real row transition).
-          # Cumulative skip is implicit since skipped transitions are 0 and
-          # contribute nothing to the sum.
-          _next_firing_rowInc = 0
-          for _k in range(batchIdx, numBatches):
-            if next_rowInc_per_batch[_k] != 0:
-              _next_firing_rowInc = next_rowInc_per_batch[_k]
-              break
+          # inter_iter_rowInc：邊界後第一個真正跨 row（給 delayed primer）。
+          # inter_iter_rowInc: first real row crossing at/after this boundary (delayed primer).
+          _next_firing_rowInc = next_firing_per_batch[batchIdx]
+          # direct_next_rowInc：剛好在邊界的 delta（切在 row 中間則為 0）。
+          # direct_next_rowInc: delta exactly at the boundary (0 if the next batch starts mid-row).
           _direct_next_rowInc = next_rowInc_per_batch[batchIdx] if batchIdx < numBatches else 0
           actLoopModule.add(self.globalWriteBatch(kernel, tPA, tPB, activation, ss, batchIdx, \
               applyAlpha, beta, edge, atomic, gwvw, atomicW, \
@@ -16565,6 +16618,12 @@ class KernelWriterAssembly(KernelWriter):
               activationTypeStr, elementSgprs, tmpSgpr, codeAccVgprRead, codeMulAlpha, factorDim, numBatches, \
               _next_firing_rowInc, _direct_next_rowInc))
           biasLocalBarrierInit = True
+
+        # SRVW+CLS：offset vgpr 由 batch 0 checkout，這條 store loop 最後一筆才 checkIn。
+        # SRVW+CLS: offset vgpr is checked out by batch 0; release it after the last batch of this store loop.
+        if kernel["StoreRemapVectorWidth"] and kernel["CompactLoopStore"] and getattr(self, "compactLoopStoreVgpr", -1) != -1:
+          self.vgprPool.checkIn(self.compactLoopStoreVgpr)
+          self.compactLoopStoreVgpr = -1
 
         ss.resetState()
         actLoopModuleList.append(actLoopModule)
@@ -17077,8 +17136,12 @@ class KernelWriterAssembly(KernelWriter):
         else:
           addr0 = vgpr(addrCalc.addrGSUSyncVgprs,2)
           addr1 = ""
-        if ss.optSrdIncForRow and addrCalc.rowInc:
-          module.add(addrCalc.incrementToNextRow(kernel, "TD", ss, tmpS01))
+        module.add(TextBlock("\n/* ss.optSrdIncForRow (%s) addrCalc.rowInc (%s) -> elementIdx (%s) batchIdx (%s)*/\n"%(ss.optSrdIncForRow, addrCalc.rowInc, elementIdx, batchIdx)))
+        # CLS 第一筆 store（elt0/batch0）即使 rowInc==0 也要 prime SrdTD。
+        # First CLS store (elt0/batch0) must prime SrdTD even when rowInc==0.
+        if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and elementIdx == 0 and batchIdx == 0))):
+          module.add(addrCalc.incrementToNextRow(kernel, "TD", ss, tmpS01, forceinitrow0=1,
+                                                 overrideAfterPrimerRows=overrideAfterPrimerRows))
         dataType     = kernel["ProblemType"]["DestDataType"]
         globalOffset = addrCalc.globalOffset
         globalOffset = int((globalOffset/self.states.bpeCexternal) * self.states.bpr * kernel["ProblemType"]["DestDataType"].numRegisters())
