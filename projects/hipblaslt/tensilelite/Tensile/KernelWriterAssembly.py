@@ -16808,9 +16808,10 @@ class KernelWriterAssembly(KernelWriter):
         else:
           assert 0, "%s\nchooseGlobalRead: bad bpl %u"%(self.states.kernelName,bpl)
 
-      # buffer_load offset field is 12-bit.
-      # if offset >= 4096, use soffset instead
-      if offset >= 4096:
+      # MUBUF immediate offset：gfx1250 是 24-bit，其他 12-bit。超過就改走 sgpr soffset。
+      # MUBUF immediate offset is 24-bit on gfx1250, 12-bit elsewhere. If it exceeds the field, use an SGPR soffset.
+      maxBufferOffset = (1 << 24) if self.states.version[:2] == (12, 5) else 4096
+      if offset >= maxBufferOffset:
         if soffset in (0, "0"):
           mubuf = MUBUFModifiers(offen=True, offset12=0, glc=glc, slc=slc, nt=nt, lds=lds, scope=scope, th=th, nv=nv)
           with self.allocTmpSgpr(1, tag="chooseGlobalRead_tmpSgprInfo") as tmpSgprInfo:
@@ -16889,6 +16890,10 @@ class KernelWriterAssembly(KernelWriter):
 
     module = Module("chooseGlobalWrite %s -> %s (%s)"%(srcVgpr, addr0, addr1))
 
+    # MUBUF immediate offset：gfx1250 是 24-bit，其他 12-bit。
+    # MUBUF immediate offset is 24-bit on gfx1250, 12-bit elsewhere.
+    maxBufferOffset = (1 << 24) if self.states.version[:2] == (12, 5) else 4096
+
     def bufferStoreImpl(tmpSgpr, mubuf):
       if bps==1 and hi16:
         module.add(BufferStoreD16HIB16(src=vgpr(srcVgpr, rpv*4), vaddr=addr0, \
@@ -16921,7 +16926,7 @@ class KernelWriterAssembly(KernelWriter):
                                   saddr=addr1, soffset=tmpSgpr, mubuf=mubuf, comment=comment))
         for i in range(1, rounds):
           offset2 = offset+shiftByte*i
-          if offset2 >= 4096:
+          if offset2 >= maxBufferOffset:
             module.add(SMovB32(dst=tmpSgpr, src=offset2, comment="large offset"))
             offset2 = 0
           mubuf2 = MUBUFModifiers(offen=True, offset12=offset2, glc=glc, slc=slc, dlc=dlc, nt=nt, isStore=True, scope=scope, th=th, nv=nv)
@@ -16934,14 +16939,14 @@ class KernelWriterAssembly(KernelWriter):
     if useBuffer:
       mubuf = MUBUFModifiers(offen=True, offset12=offset, glc=glc, slc=slc, dlc=dlc, nt=nt, isStore=True, scope=scope, th=th, nv=nv)
       if soffset != 0:
-        assert offset < 4096, "sgpr offset provided with large const offset"
-      # buffer_load offset field is 12-bit.
-      # if offset >= 4096, use soffset instead
+        assert offset < maxBufferOffset, "sgpr offset provided with large const offset"
+      # 常數 offset（含 split shift）超過 MUBUF 欄位時改走 soffset。gfx1250 24-bit 很少觸發。
+      # If the constant offset (plus split shift) exceeds the MUBUF field, use soffset. Rarely hits on gfx1250 24-bit.
       maxShift = max(bps - 16, 0) #if bps = 32 or bps = 64
-      if (offset + maxShift) >= 4096:
+      if (offset + maxShift) >= maxBufferOffset:
         with self.allocTmpSgpr(1, tag="chooseGlobalWrite_tmpSgprInfo") as tmpSgprInfo:
           tmpSgpr = sgpr(tmpSgprInfo.idx)
-          if offset >= 4096:
+          if offset >= maxBufferOffset:
             module.add(SMovB32(dst=tmpSgpr, src=offset, comment="large offset"))
             mubuf = MUBUFModifiers(offen=True, offset12=0, glc=glc, slc=slc, dlc=dlc, nt=nt, isStore=True, scope=scope, th=th, nv=nv)
           bufferStoreImpl(tmpSgpr, mubuf)
