@@ -54,16 +54,21 @@ def timing_context(category_name):
     tracked because there are only ~a dozen calls per run — the overhead
     is negligible relative to the seconds-scale measurements.  C++ overhead
     is tracked separately via a calibrated timing_overhead record.
+
+    Always prints a human-readable phase summary; buffered TIMING records are
+    emitted when TimingInstrumentation is enabled.
     """
-    if globalParameters.get("TimingInstrumentation", False):
-        start = time.time_ns()
-        try:
-            yield
-        finally:
-            elapsed_ns = time.time_ns() - start
-            _timing_buffer.append((category_name, elapsed_ns / 1_000_000))
-    else:
+    start = time.time()
+    start_ns = time.time_ns()
+    try:
         yield
+    finally:
+        elapsed = time.time() - start
+        print(f"{category_name}: Done. ({elapsed:.1f} secs elapsed)")
+        sys.stdout.flush()
+        if globalParameters.get("TimingInstrumentation", False):
+            elapsed_ns = time.time_ns() - start_ns
+            _timing_buffer.append((category_name, elapsed_ns / 1_000_000))
 
 
 def flush_timing_buffer():
