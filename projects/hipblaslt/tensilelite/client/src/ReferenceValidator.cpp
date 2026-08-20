@@ -34,7 +34,10 @@
 #include <Tensile/DataTypes.hpp>
 #include <Tensile/hip/HipUtils.hpp>
 
+#include <chrono>
 #include <cstddef>
+#include <iomanip>
+#include <iostream>
 #include <sstream>
 
 namespace TensileLite
@@ -886,9 +889,14 @@ namespace TensileLite
                     = elementsToCopy - (tensor.totalAllocatedElements() + elementsBeforeData);
             }
 
+            double readbackMs = 0;
             {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 ScopedTimer timer("validate_gpu_readback");
                 HIP_CHECK_EXC(hipMemcpy(m_cpuResultBuffer.get(), copySource, bytesToCopy, copykind));
+                readbackMs = std::chrono::duration<double, std::milli>(
+                                 std::chrono::high_resolution_clock::now() - t0)
+                                 .count();
             }
             // If there was extra data allocated before the tensor to do bounds
             // checking, resultBuffer is the whole allocation, while resultData
@@ -903,7 +911,9 @@ namespace TensileLite
 
             size_t boundsCheckElements = 0;
 
+            double compareMs = 0;
             {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 ScopedTimer timer("validate_element_comparison");
 
                 for(ptrdiff_t i = 0; i < elementsBeforeData; i++)
@@ -950,7 +960,19 @@ namespace TensileLite
                 {
                     compareInvalid.after(resultAfterData[i], i, elementsAfterData);
                 }
+                compareMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::high_resolution_clock::now() - t0)
+                                .count();
             }
+
+            std::cout << std::fixed << std::setprecision(1)
+                      << "VALIDATE_DETAIL tensor=" << tensor.getName()
+                      << " bytes=" << bytesToCopy
+                      << " logical_elems=" << tensor.totalLogicalElements()
+                      << " stride=" << validationStride
+                      << " readback_ms=" << readbackMs
+                      << " compare_ms=" << compareMs << '\n';
+            std::cout.flush();
 
             if(boundsCheckElements > 0)
                 std::cout << "Performed bounds check on " << boundsCheckElements << " elements ("
