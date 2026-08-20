@@ -72,6 +72,7 @@
 #include <limits> // std::numeric_limits<> sentinel
 #endif
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -81,6 +82,66 @@ namespace TensileLite
 {
     namespace Client
     {
+        namespace
+        {
+            using WallClock = std::chrono::high_resolution_clock;
+
+            double elapsedMs(WallClock::time_point t0)
+            {
+                return std::chrono::duration<double, std::milli>(WallClock::now() - t0).count();
+            }
+
+            struct SolBreakdown
+            {
+                double sel        = 0;
+                double pre        = 0;
+                double gpu_reset  = 0;
+                double solve      = 0;
+                double warmup     = 0;
+                double validate   = 0;
+                double bench      = 0;
+                double post       = 0;
+                double wall       = 0;
+            };
+
+            SolBreakdown g_solSum;
+            size_t       g_solCount = 0;
+
+            void printSolBreakdown(size_t idx, SolBreakdown const& b)
+            {
+                std::cout << std::fixed << std::setprecision(1) << "SOL_BREAKDOWN idx=" << idx
+                          << " wall_ms=" << b.wall << " sel=" << b.sel << " pre=" << b.pre
+                          << " gpu_reset=" << b.gpu_reset << " solve=" << b.solve
+                          << " warmup=" << b.warmup << " validate=" << b.validate
+                          << " bench=" << b.bench << " post=" << b.post << '\n';
+                std::cout.flush();
+                g_solSum.sel += b.sel;
+                g_solSum.pre += b.pre;
+                g_solSum.gpu_reset += b.gpu_reset;
+                g_solSum.solve += b.solve;
+                g_solSum.warmup += b.warmup;
+                g_solSum.validate += b.validate;
+                g_solSum.bench += b.bench;
+                g_solSum.post += b.post;
+                g_solSum.wall += b.wall;
+                g_solCount++;
+            }
+
+            void printSolBreakdownSum()
+            {
+                if(g_solCount == 0)
+                    return;
+                double n = static_cast<double>(g_solCount);
+                std::cout << std::fixed << std::setprecision(1) << "SOL_BREAKDOWN_SUM n=" << g_solCount
+                          << " wall_ms=" << g_solSum.wall << " mean_wall=" << (g_solSum.wall / n)
+                          << " sel=" << g_solSum.sel << " pre=" << g_solSum.pre
+                          << " gpu_reset=" << g_solSum.gpu_reset << " solve=" << g_solSum.solve
+                          << " warmup=" << g_solSum.warmup << " validate=" << g_solSum.validate
+                          << " bench=" << g_solSum.bench << " post=" << g_solSum.post << '\n';
+                std::cout.flush();
+            }
+        }
+
         __global__ void flush_icache()
         {
             asm __volatile__("s_icache_inv \n\t"
@@ -1356,20 +1417,27 @@ int main(int argc, const char* argv[])
                 // solution's problemType.mxScaleFormat to pick the correct host
                 // upload layout for MX scale tensors. The extra upload is a no-op
                 // cost on non-MX problems.
-                bool resetInput = true;
+                bool   resetInput = true;
+                size_t solIdx     = 0;
                 while(solutionIterator->moreSolutionsInProblem())
                 {
+                    SolBreakdown b;
+                    auto         solWall0 = WallClock::now();
                     std::shared_ptr<ContractionSolution> solution;
                     {
+                        auto        t0 = WallClock::now();
                         ScopedTimer timer("solution_selection");
-                        solution = solutionIterator->getSolution();
+                        solution       = solutionIterator->getSolution();
+                        b.sel          = elapsedMs(t0);
                     }
                     if(solution == nullptr)
                         throw std::runtime_error("Could not find a solution");
 
                     {
+                        auto        t0 = WallClock::now();
                         ScopedTimer timer("pre_solution");
                         listeners.preSolution(solution.get());
+                        b.pre = elapsedMs(t0);
                     }
                     if(solutionIterator->runCurrentSolution() && runKernels)
                     {
@@ -1379,14 +1447,17 @@ int main(int argc, const char* argv[])
                             {
                                 if(resetInput)
                                 {
+                                    auto        t0 = WallClock::now();
                                     ScopedTimer timer("gpu_input_reset");
                                     auto inputs = dataInit->prepareGPUInputs(problem);
                                     inputArr[0] = inputs;
+                                    b.gpu_reset += elapsedMs(t0);
                                 }
                                 resetInput = true;
 
                                 std::vector<std::vector<KernelInvocation>> kernels;
                                 {
+                                    auto        t0 = WallClock::now();
                                     ScopedTimer timer("kernel_solving");
                                     for(size_t r = 0; r < inputArr.size(); r++)
                                     {
@@ -1407,6 +1478,7 @@ int main(int argc, const char* argv[])
                                                                             stream);
                                         kernels.push_back(kernel);
                                     }
+                                    b.solve += elapsedMs(t0);
                                 }
 
                                 size_t       warmupInvocations = listeners.numWarmupRuns();
@@ -1426,21 +1498,26 @@ int main(int argc, const char* argv[])
                                 if(warmupInvocations > 0)
                                 {
                                     {
+                                        auto        t0 = WallClock::now();
                                         ScopedTimer timer("warmup_runs");
                                         listeners.preWarmup();
                                         HIP_CHECK_EXC(adapter.launchKernels(kernels[0],
                                                                             stream,
                                                                             warmupStartEvents[0],
                                                                             warmupStopEvents[0]));
+                                        b.warmup += elapsedMs(t0);
                                     }
 
                                     {
+                                        auto        t0 = WallClock::now();
                                         ScopedTimer timer("validate_warmups");
                                         listeners.validateWarmups(
                                             inputs, warmupStartEvents, warmupStopEvents);
+                                        b.validate += elapsedMs(t0);
                                     }
 
                                     {
+                                        auto        t0 = WallClock::now();
                                         ScopedTimer timer("warmup_runs");
                                         for(int i = 1; i < warmupInvocations; i++)
                                         {
@@ -1452,6 +1529,7 @@ int main(int argc, const char* argv[])
                                         }
                                         listeners.postWarmup(
                                             warmupStartEvents, warmupStopEvents, stream);
+                                        b.warmup += elapsedMs(t0);
                                     }
                                 }
 
@@ -1472,6 +1550,7 @@ int main(int argc, const char* argv[])
                                 size_t eventCount = gpuTimer ? kernels[0].size() : 0;
 
                                 {
+                                    auto        t0 = WallClock::now();
                                     ScopedTimer timer("benchmark_runs");
                                     listeners.preSyncs();
                                     if(enq)
@@ -1504,6 +1583,7 @@ int main(int argc, const char* argv[])
                                         }
 
                                     listeners.postSyncs();
+                                    b.bench += elapsedMs(t0);
                                 }
 
                                 if(useUserArgs)
@@ -1521,9 +1601,14 @@ int main(int argc, const char* argv[])
                     }
 
                     {
+                        auto        t0 = WallClock::now();
                         ScopedTimer timer("post_solution");
                         listeners.postSolution();
+                        b.post = elapsedMs(t0);
                     }
+
+                    b.wall = elapsedMs(solWall0);
+                    printSolBreakdown(solIdx++, b);
 
                     if(exitOnError && listeners.error() > 0)
                     {
@@ -1547,6 +1632,8 @@ int main(int argc, const char* argv[])
         ScopedTimer timer("finalize_report");
         listeners.finalizeReport();
     }
+
+    printSolBreakdownSum();
 
     // Flush all buffered timing records to stderr.
     // Timed with raw chrono instead of ScopedTimer because ScopedTimer pushes
