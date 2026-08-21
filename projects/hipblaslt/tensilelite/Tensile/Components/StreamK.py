@@ -1563,8 +1563,6 @@ class StreamK(Component):
         # CompactLoopStore: 把 batch 對齊整組 N-group，讓後面 CLS 能 compact。
         # CompactLoopStore: align batch size to a whole N-group so the CLS loop can compact.
         numElementsPerBatchPreCLS = numElementsPerBatch
-        # DEBUG：`if 1:` 永遠跑 align；應改回 `if kernel["CompactLoopStore"]:`（inner 已自己 guard）。
-        # DEBUG: `if 1:` always runs align; should be `if kernel["CompactLoopStore"]:` (inner already guards).
         if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
             numElementsPerBatch = self._skAlignNEPBForCLS(kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
 
@@ -2216,8 +2214,6 @@ class StreamK(Component):
             # them (mirrors partialsWriteProcedure). Keep the pre-align value for
             # the CLS debug banner.
             numElementsPerBatchPreCLS = numElementsPerBatch
-            # DEBUG：`if 1:` 永遠跑 align。即使 NEPBS 有設也要 shrink，否則 pinned NEPBS 常常不能整除、CLS 開不起來。
-            # DEBUG: `if 1:` always runs align. Shrink even when NEPBS is set, else a pinned NEPBS often does not divide and CLS cannot loop.
             if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
                 numElementsPerBatch = self._skAlignNEPBForCLS(kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
             numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))

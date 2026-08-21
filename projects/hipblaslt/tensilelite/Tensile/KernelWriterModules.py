@@ -296,7 +296,7 @@ def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
           elif write:
             itemList[destIdx] = VMovB32(dst=vgpr("ValuC+%u"%srcIdx),
                                              src=vgpr(Holder(name="ValuC")),
-                                             comment="copy vreg[%u] to MI out reg" % destIdx) 
+                                             comment="copy vreg[%u] to MI out reg" % destIdx)
           else:
             itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
                                              src=vgpr("ValuC+%u"%srcIdx),

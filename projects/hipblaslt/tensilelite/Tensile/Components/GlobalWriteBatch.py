@@ -338,18 +338,16 @@ class GlobalWriteBatchWriter:
     We take the largest iterCount that divides gcd(maxNIter, numBatches) (so it
     is a whole-N-row grouping AND splits the batches evenly) and whose (B) shift
     is uniform. Otherwise a single fully-unrolled iteration (m0Step dead).
-    forceNoCompact still forces iterCount = 1. SRVW / StreamK are no longer excluded.
+    Pass forceNoCompact=True (or flip the check below) to force iterCount = 1 when debugging.
+    SRVW / StreamK are no longer excluded.
     """
     m0Step = 1
     if not kernel["EnableMatrixInstruction"]:
       return numBatches, 1, m0Step
 
-    # 只剩 DEBUG forceNoCompact 會關掉迴圈；SRVW / StreamK 也可以 compact。
-    # Only DEBUG forceNoCompact still disables the loop; SRVW / StreamK may compact.
-    if forceNoCompact:
-      return numBatches, 1, m0Step
-
-    if numBatches <= 1:
+    # DEBUG：傳 forceNoCompact=True 可強制 iterCount=1。numBatches<=1 本來就不能 loop。
+    # DEBUG: pass forceNoCompact=True to force iterCount=1. numBatches<=1 cannot loop anyway.
+    if forceNoCompact or numBatches <= 1:
       return numBatches, 1, m0Step
 
     # (A) 只 compact 最外層 N tile；沒有 N 可走就 loop=1。
@@ -360,6 +358,10 @@ class GlobalWriteBatchWriter:
     if maxNIter <= 1:
       return numBatches, 1, m0Step
 
+    # (B) 前置：acc→arch 總長必須能被 numBatches 整除，每個 batch 才是同樣大的 arch slice。
+    # 除不盡（或沒有 acc）就不能共用一份 body / 一個 M0 step。
+    # (B) prelude: acc→arch length must divide numBatches so each batch is an equal arch slice.
+    # A remainder (or empty acc) cannot share one body / one M0 step.
     totalLen = getAccToArchLen(kernel)
     if totalLen <= 0 or totalLen % numBatches != 0:
       return numBatches, 1, m0Step
@@ -405,12 +407,7 @@ class GlobalWriteBatchWriter:
     return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)[0]
 
   def _computeBatchesPerCLSBody(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())[0]
-
-  def _clsForceNoCompact(self) -> bool:
-    # DEBUG：永遠 False。設 True 可強制某條 store variant 的 iterCount=1。
-    # DEBUG: always False. Set True to force iterCount=1 for one store variant.
-    return bool(False)
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw)[0]
 
   @staticmethod
   def computeCLSIterCount(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None) -> int:
@@ -418,10 +415,10 @@ class GlobalWriteBatchWriter:
     return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw)[1]
 
   def _computeCLSIterCount(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())[1]
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw)[1]
 
   def _computeCLSLayout(self):
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw, self._clsForceNoCompact())
+    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches, len(self.batchElements), self.gwvw)
 
   def emit(self) -> Module:
     assert self._checkAtomicPreconditions()
@@ -1801,12 +1798,12 @@ class GlobalWriteBatchWriter:
 
           # CLS：先加「上一發 primed 的 rows」，再把下一發寫進 vgpr（delayed primer）。
           # CLS: add the previously primed rows first, then write the next look-ahead into the vgpr (delayed primer).
-          if not (self.kernel["CompactLoopStore"] and _emitOverrideRows):
-            module.add(VMovB32(vgpr(self.tmpVgpr), addrCalc.rowInc, comment="set shift rows"))
-            module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.tmpVgpr), "shift storeRemap coord1"))
           if self.kernel["CompactLoopStore"] and _emitOverrideRows:
             module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.CompactLoopStoreVgpr), "shift storeRemap coord1"))
             module.add(VMovB32(vgpr(self.CompactLoopStoreVgpr), _emitOverrideRows, comment="set shift rows"))
+          else:
+            module.add(VMovB32(vgpr(self.tmpVgpr), addrCalc.rowInc, comment="set shift rows"))
+            module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.tmpVgpr), "shift storeRemap coord1"))
 
       # When stores are interleaved (GLS=0) with subtile NonEdge guards, the
       # M-guard branch for the last store in N-group K targets the N-group end
@@ -2164,7 +2161,6 @@ class GlobalWriteBatchWriter:
       if self.needsAccumToDestConversion:
         # pack 用獨立 scratch，勿用 tmpS01（那是 row-inc primer）。
         # Pack via a dedicated scratch sgpr, not tmpS01 (row-inc primer chain).
-        tmpInrSgpr = self._epilogScratchSgpr(1)
         if self.kernel["ActivationFuncCall"] and activationCDataType == self.kernel["ProblemType"]["DestDataType"]:
           destIdx = self.activationSetPCStruct.vgprActCopy
         else:
@@ -2201,10 +2197,9 @@ class GlobalWriteBatchWriter:
           if self.kernel["ProblemType"]["ComputeDataType"].isSingle() and ((self.parentWriter.states.useBias == DataDirection.READ) or self.kernel["ActivationFuncCall"] or self.applyAlpha or self.beta):
             convertModule = convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_F32_to_I32, roundType=RoundType.ROUND_TO_NEAREST_EVEN, \
                                         inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
-          packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.cvtVgprStruct, tmpInrSgpr,
+          packModule = self.packdata(self.gwvw, destIdx, self.ss.elementSumIdx[elementIdx], self.cvtVgprStruct, packTmpS01,
                                      SaturateTypeInt8=SaturateTypeInt8, inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu)
         self._epilogScratchFree(packTmpS01)
-        self._epilogScratchFree(tmpInrSgpr)
 
       if self.parentWriter.states.asmCaps["HasWMMA_V1"] and self.kernel["EnableMatrixInstruction"] and self.kernel["ProblemType"]["DestDataType"].isHalf() and (not self.kernel["ProblemType"]["HighPrecisionAccumulate"]):
         for vi in range(0, self.gwvw):
