@@ -1565,7 +1565,7 @@ class StreamK(Component):
         numElementsPerBatchPreCLS = numElementsPerBatch
         # DEBUG：`if 1:` 永遠跑 align；應改回 `if kernel["CompactLoopStore"]:`（inner 已自己 guard）。
         # DEBUG: `if 1:` always runs align; should be `if kernel["CompactLoopStore"]:` (inner already guards).
-        if 1:# kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
+        if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
             numElementsPerBatch = self._skAlignNEPBForCLS(kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
 
         numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
@@ -1771,28 +1771,8 @@ class StreamK(Component):
         return (kernel["WavefrontSize"] * waveNum) * kernel["StoreVectorWidth"] * writer.states.bpeCinternal
 
     def _skAlignNEPBForCLS(self, kernel, nElem, numElementsPerBatch, gwvw, edge):
-        """把 NEPB 收到能整除 N-group 的最大 cand（不超出原 VGPR budget）。
-        Shrink NEPB to the largest N-group divisor that still fits the existing VGPR budget.
-        """
-        if not (kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not edge):
-            return numElementsPerBatch
         from .GlobalWriteBatch import GlobalWriteBatchWriter
-        maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
-        if maxNIter <= 1 or nElem % maxNIter != 0:
-            return numElementsPerBatch
-        elemsPerNGroup = nElem // maxNIter
-        # half/bf16 pack two elements per 32b register, so a batch must be even
-        # unless gwvw already makes the ValuC count even.
-        cdt = kernel["ProblemType"]["ComputeDataType"]
-        needsEven = (cdt.isHalf() or cdt.isBFloat16()) and ((gwvw % 2) == 1)
-        budget = min(elemsPerNGroup, max(1, numElementsPerBatch))
-        for cand in range(budget, 0, -1):
-            if elemsPerNGroup % cand != 0:
-                continue
-            if needsEven and cand > 1 and (cand % 2) != 0:
-                continue
-            return cand
-        return numElementsPerBatch
+        return GlobalWriteBatchWriter.alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge)
 
     def _skEmitCLSBatchLoop(self, writer, kernel, tmpS01, iterCount, batchesPerBody,
                             m0Step, increment, labelBase, emitBatch):
@@ -2238,7 +2218,7 @@ class StreamK(Component):
             numElementsPerBatchPreCLS = numElementsPerBatch
             # DEBUG：`if 1:` 永遠跑 align。即使 NEPBS 有設也要 shrink，否則 pinned NEPBS 常常不能整除、CLS 開不起來。
             # DEBUG: `if 1:` always runs align. Shrink even when NEPBS is set, else a pinned NEPBS often does not divide and CLS cannot loop.
-            if 1:# kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
+            if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
                 numElementsPerBatch = self._skAlignNEPBForCLS(kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
             numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
 

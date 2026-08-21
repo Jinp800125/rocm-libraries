@@ -288,6 +288,30 @@ class GlobalWriteBatchWriter:
     return 1
 
   @staticmethod
+  def alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge):
+    """把 NEPB 收到能整除 N-group 的最大 cand（不超出原 VGPR budget）。
+    Shrink NEPB to the largest N-group divisor that still fits the existing VGPR budget.
+    """
+    if not (kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not edge):
+      return numElementsPerBatch
+    maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
+    if maxNIter <= 1 or nElem % maxNIter != 0:
+      return numElementsPerBatch
+    elemsPerNGroup = nElem // maxNIter
+    # half/bf16 pack two elements per 32b register, so a batch must be even
+    # unless gwvw already makes the ValuC count even.
+    cdt = kernel["ProblemType"]["ComputeDataType"]
+    needsEven = (cdt.isHalf() or cdt.isBFloat16()) and ((gwvw % 2) == 1)
+    budget = min(elemsPerNGroup, max(1, numElementsPerBatch))
+    for cand in range(budget, 0, -1):
+      if elemsPerNGroup % cand != 0:
+        continue
+      if needsEven and cand > 1 and (cand % 2) != 0:
+        continue
+      return cand
+    return numElementsPerBatch
+
+  @staticmethod
   def computeCLSLayout(kernel, numBatches: int, numElementsPerBatch: int = None, gwvw: int = None, forceNoCompact: bool = False, flatWorkspaceWalk: bool = False):
     """Single source of truth for the CLS loop layout math.
 

@@ -998,27 +998,16 @@ class GSUOn(GSU):
             #  numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
             #  #print "  NumVectorsPerBatch", numVectorsPerBatch
             #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
-            numBatches = max(1, ceilDivide(len(elements[edgeI]),numElementsPerBatch))
-
-            # CLS 只對齊 partial 的 NEPB（縮小、不超出 VGPR/SGPR）；reduction 仍用原本 batch size。
-            # CLS aligns partial NEPB only (shrink, stay in VGPR/SGPR budget); reduction keeps the original batch size.
-            pwNEPB = numElementsPerBatch
-            if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not edge:
-                from .GlobalWriteBatch import GlobalWriteBatchWriter as _GWBW
-                _maxNIter = _GWBW.clsMaxNIter(kernel)
-                _nElem = len(elements[edgeI])
-                if _maxNIter > 1 and _nElem % _maxNIter == 0:
-                    _elemsPerNGroup = _nElem // _maxNIter
-                    _cdt = kernel["ProblemType"]["ComputeDataType"]
-                    _needsEven = (_cdt.isHalf() or _cdt.isBFloat16()) and ((gwvw % 2) == 1)
-                    for _cand in range(min(_elemsPerNGroup, max(1, numElementsPerBatch)), 0, -1):
-                        if _elemsPerNGroup % _cand != 0:
-                            continue
-                        if _needsEven and _cand > 1 and (_cand % 2) != 0:
-                            continue
-                        pwNEPB = _cand
-                        break
-            pwNumBatches = max(1, ceilDivide(len(elements[edgeI]), pwNEPB))
+            # CLS：NEPB 收到能整除 N-group 的最大 cand；partial / reduction 共用（縮小、不超出 VGPR/SGPR）。
+            # CLS: shrink NEPB to the largest N-group divisor; partial and reduction share it (stay in VGPR/SGPR budget).
+            # NEPBS 有設就不要 shrink，保留 pin 的 batch size（跟 StreamK 一樣）。
+            # Skip shrink when NEPBS is pinned, same as StreamK.
+            from .GlobalWriteBatch import GlobalWriteBatchWriter
+            numElementsPerBatchPreCLS = numElementsPerBatch
+            if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
+                numElementsPerBatch = GlobalWriteBatchWriter.alignNEPBForCLS(
+                    kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
+            numBatches = max(1, ceilDivide(len(elements[edgeI]), numElementsPerBatch))
 
             numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
 
@@ -1058,8 +1047,7 @@ class GSUOn(GSU):
                 # CLS: fold partials into one countdown; M0 reindexes acc, WS soffset keeps walking.
                 # flatWorkspaceWalk：WS 是線性 soffset，不受 N-tile / clsMaxNIter 限制。
                 # flatWorkspaceWalk: linear WS soffset, not bound by N-tile / clsMaxNIter.
-                from .GlobalWriteBatch import GlobalWriteBatchWriter
-                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, pwNumBatches, pwNEPB, gwvw, flatWorkspaceWalk=True)
+                clsBPB, clsIter, clsM0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, numElementsPerBatch, gwvw, flatWorkspaceWalk=True)
                 pwUseCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
                     and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
 
@@ -1071,17 +1059,16 @@ class GSUOn(GSU):
                         module.add(self.lastGsuWgBusyWaiting(writer, kernel, ss, tmpSgpr, tmpVgpr, lastGsuWgBusyWaitingLabel, reductionBodyLabel))
                         module.add(partialWriteLabel)
                     module.addComment0("MBSK CLS (partial write) auto-adjust: numElementsPerBatch %u -> %u, numBatches=%u" %
-                        (numElementsPerBatch, pwNEPB, pwNumBatches))
+                        (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
                     module.addComment0("MBSK CLS (partial write) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
                         (clsBPB, clsIter, clsM0Step))
                     clsCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSLoopCounter", preventOverflow=False)
                     clsM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSm0Base", preventOverflow=False)
-                    pwInc = kernel["NumThreads"] * kernel["StoreVectorWidth"] * writer.states.bpeCinternal
                     module.add(SMovB32(dst=sgpr(clsM0Base), src=0, comment="MBSK CLS M0 base = 0"))
                     module.add(SMovB32(dst=sgpr(clsCounter), src=clsIter, comment="MBSK CLS loop iter count = %u" % clsIter))
                     # Serial*bpe 只算一次；乘法暫用 tmpSgpr，隨後設 soffset=0（MBSK 是 store-then-add）。
                     # Compute Serial*bpe once; tmpSgpr is multiply scratch, then soffset=0 (MBSK is store-then-add).
-                    ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, elements[edgeI][0:pwNEPB], elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+                    ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, elements[edgeI][0:numElementsPerBatch], elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
                     clsAddrDVgpr = ss.elementAddr[0].addrDVgpr
                     module.add(vectorStaticMultiply(vgpr(clsAddrDVgpr), vgpr("Serial"), kernel["StoreVectorWidth"] * writer.states.bpeCinternal, ContinuousRegister(tmpSgpr.idx, 1)))
                     module.add(SMovB32(dst=sgpr(tmpSgpr.idx), src=hex(0),
@@ -1091,8 +1078,8 @@ class GSUOn(GSU):
                     module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0Base), comment="MBSK CLS M0 = base (v_movrelsd src offset)"))
                     module.add(SAddU32(dst=sgpr(clsM0Base), src0=sgpr(clsM0Base), src1=clsM0Step, comment="MBSK CLS M0 step"))
                     for bIdx in range(0, clsBPB):
-                        _start = bIdx * pwNEPB
-                        _stop  = min(_start + pwNEPB, len(elements[edgeI]))
+                        _start = bIdx * numElementsPerBatch
+                        _stop  = min(_start + numElementsPerBatch, len(elements[edgeI]))
                         # bIdx==0 reuses the ss setup already done in the preamble
                         # (for the hoisted store-address multiply), so skip re-setup
                         # to avoid a duplicate vgprValuC checkOut.
@@ -1124,6 +1111,8 @@ class GSUOn(GSU):
                     and kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'
 
                 if rdUseCLS:
+                    module.addComment0("MBSK CLS (reduction) auto-adjust: numElementsPerBatch %u -> %u, numBatches=%u" %
+                        (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
                     module.addComment0("MBSK CLS (reduction) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
                         (rdBPB, rdIter, rdM0Step))
                     rdCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSRdLoopCounter", preventOverflow=False)
