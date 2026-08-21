@@ -1091,53 +1091,32 @@ class GSUOn(GSU):
                     and codeAccVgprWrite is not None and kernel["LocalSplitU"] == 1 and not edge \
                     and kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel'
 
+                rdClsLabel = rdCounter = rdM0Base = rdGsuM1 = None
                 if rdUseCLS:
                     module.addComment0("MBSK CLS (reduction) auto-adjust: numElementsPerBatch %u -> %u, numBatches=%u" %
                         (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
                     module.addComment0("MBSK CLS (reduction) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
                         (rdBPB, rdIter, rdM0Step))
-                    rdCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSRdLoopCounter", preventOverflow=False)
-                    rdM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSRdm0Base", preventOverflow=False)
-                    rdGsuM1   = writer.sgprPool.checkOut(1, tag="MBSKCLSRdGsuCount", preventOverflow=False)
-                    # preamble（atomic/sync/SRD/loadOffset/GSU count）只跑一次；bIdx==0 skipSetup 重用 vgpr。
-                    # Run preamble (atomic/sync/SRD/loadOffset/GSU count) once; bIdx==0 skipSetup reuses those vgprs.
-                    firstBatchElements = elements[edgeI][0:numElementsPerBatch]
-                    ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, firstBatchElements, elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
-                    module.add(self.GSUSynccodegenOpt(kernel, writer, ss, 0, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw, firstBatchElements, \
-                            endLabel, ss.elementSumIdx[0], ss.elementAddr[0].addrDVgpr, reductionBodyLabel, \
-                            clsLoop=True, clsPreambleOnly=True, clsGsuM1Sgpr=rdGsuM1))
-                    module.add(SMovB32(dst=sgpr(rdM0Base), src=0, comment="MBSK CLS (reduction) M0 base = 0"))
-                    module.add(SMovB32(dst=sgpr(rdCounter), src=rdIter, comment="MBSK CLS (reduction) loop iter count = %u" % rdIter))
-                    rdClsLabel = Label(writer.labels.getNameInc("MBSK_Reduction_CLS"), "")
-                    module.add(rdClsLabel)
-                    # body 內自己設 M0：READ 用 [9:0]，WRITE 用 [25:16]；rdM0Base 在 body 之後才 +m0Step。
-                    # Body sets M0 itself: READ via [9:0], WRITE via [25:16]; rdM0Base steps after the body.
-                    for bIdx in range(0, rdBPB):
-                        elementStartIdx = bIdx * numElementsPerBatch
-                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                        module.add(self.reductionBatch(writer, kernel, ss, bIdx, alpha, beta, edge, atomic, \
-                                gwvw, elementsThisBatch, tmpVgpr, tmpVgprDynamic, elementSgprs, tmpSgpr, \
-                                codeAccVgprReadBackup, codeAccVgprWrite, reductionBodyLabel, endLabel, \
-                                clsLoop=True, clsSkipPreamble=True, skipSetup=(bIdx == 0), clsGsuM1Sgpr=rdGsuM1, clsM0BaseSgpr=rdM0Base))
-                    module.add(SAddU32(dst=sgpr(rdM0Base), src0=sgpr(rdM0Base), src1=rdM0Step, comment="MBSK CLS (reduction) M0 step (after body)"))
-                    module.add(SSubU32(dst=sgpr(rdCounter), src0=sgpr(rdCounter), src1=1, comment="MBSK CLS (reduction) countdown"))
-                    module.add(SCmpEQU32(src0=sgpr(rdCounter), src1=0, comment="CLS reduction loop done?"))
-                    module.add(writer.longBranchScc0(rdClsLabel, posNeg=-1, comment="loop while counter != 0"))
-                    writer.sgprPool.checkIn(rdGsuM1)
-                    writer.sgprPool.checkIn(rdM0Base)
-                    writer.sgprPool.checkIn(rdCounter)
-                else:
-                    for batchIdx in range(0, numBatches):
-                        elementStartIdx = batchIdx * numElementsPerBatch
-                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                        # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
-                        # elementVgprs can be large and should be perfectly tuned to the number of available
-                        # VGPRS.    We do not want to accidentally overflow and grow the pool here:
-                        module.add(self.reductionBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, atomic, \
-                                gwvw, elementsThisBatch, tmpVgpr, tmpVgprDynamic, elementSgprs, tmpSgpr, \
-                                codeAccVgprReadBackup, codeAccVgprWrite, reductionBodyLabel, endLabel))
+                    rdCounter, rdM0Base, rdGsuM1, rdClsLabel = self._mbskReductionCLSLoopOpen(
+                        writer, module, kernel, ss, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw,
+                        elements[edgeI], elementSgprs, numElementsPerBatch, rdIter,
+                        endLabel, reductionBodyLabel)
+
+                for batchIdx in range(rdBPB if rdUseCLS else numBatches):
+                    elementStartIdx = batchIdx * numElementsPerBatch
+                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
+                    elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
+                    # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
+                    # elementVgprs can be large and should be perfectly tuned to the number of available
+                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                    module.add(self.reductionBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, atomic, \
+                            gwvw, elementsThisBatch, tmpVgpr, tmpVgprDynamic, elementSgprs, tmpSgpr, \
+                            codeAccVgprReadBackup, codeAccVgprWrite, reductionBodyLabel, endLabel, \
+                            clsLoop=rdUseCLS, clsSkipPreamble=rdUseCLS, skipSetup=(rdUseCLS and batchIdx == 0),
+                            clsGsuM1Sgpr=rdGsuM1, clsM0BaseSgpr=rdM0Base))
+
+                if rdUseCLS:
+                    self._mbskReductionCLSLoopClose(writer, module, rdCounter, rdM0Base, rdGsuM1, rdClsLabel, rdM0Step)
 
                 module.add(SWaitCnt(vlcnt=0, comment="wait for buffer_load to finish"))
                 if kernel["MbskPrefetchMethod"] == 0:
@@ -1275,6 +1254,38 @@ class GSUOn(GSU):
         module.add(writer.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
         writer.sgprPool.checkIn(clsM0Base)
         writer.sgprPool.checkIn(clsCounter)
+
+    def _mbskReductionCLSLoopOpen(self, writer, module, kernel, ss, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw,
+                                 elementsEdge, elementSgprs, numElementsPerBatch, iterCount,
+                                 endLabel, reductionBodyLabel):
+        """MBSK reduction CLS: one-time preamble + label. Pair with _mbskReductionCLSLoopClose."""
+        rdCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSRdLoopCounter", preventOverflow=False)
+        rdM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSRdm0Base", preventOverflow=False)
+        rdGsuM1   = writer.sgprPool.checkOut(1, tag="MBSKCLSRdGsuCount", preventOverflow=False)
+        # preamble（atomic/sync/SRD/loadOffset/GSU count）只跑一次；bIdx==0 skipSetup 重用 vgpr。
+        # Run preamble (atomic/sync/SRD/loadOffset/GSU count) once; bIdx==0 skipSetup reuses those vgprs.
+        firstBatchElements = elementsEdge[0:numElementsPerBatch]
+        ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, firstBatchElements, elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+        module.add(self.GSUSynccodegenOpt(kernel, writer, ss, 0, tmpSgpr, tmpVgpr, tmpVgprDynamic, gwvw, firstBatchElements, \
+                endLabel, ss.elementSumIdx[0], ss.elementAddr[0].addrDVgpr, reductionBodyLabel, \
+                clsLoop=True, clsPreambleOnly=True, clsGsuM1Sgpr=rdGsuM1))
+        module.add(SMovB32(dst=sgpr(rdM0Base), src=0, comment="MBSK CLS (reduction) M0 base = 0"))
+        module.add(SMovB32(dst=sgpr(rdCounter), src=iterCount, comment="MBSK CLS (reduction) loop iter count = %u" % iterCount))
+        rdClsLabel = Label(writer.labels.getNameInc("MBSK_Reduction_CLS"), "")
+        module.add(rdClsLabel)
+        return rdCounter, rdM0Base, rdGsuM1, rdClsLabel
+
+    def _mbskReductionCLSLoopClose(self, writer, module, rdCounter, rdM0Base, rdGsuM1, rdClsLabel, rdM0Step):
+        """MBSK reduction CLS: M0 step after body + countdown + branch. Closes _mbskReductionCLSLoopOpen."""
+        # body 內自己設 M0：READ 用 [9:0]，WRITE 用 [25:16]；rdM0Base 在 body 之後才 +m0Step。
+        # Body sets M0 itself: READ via [9:0], WRITE via [25:16]; rdM0Base steps after the body.
+        module.add(SAddU32(dst=sgpr(rdM0Base), src0=sgpr(rdM0Base), src1=rdM0Step, comment="MBSK CLS (reduction) M0 step (after body)"))
+        module.add(SSubU32(dst=sgpr(rdCounter), src0=sgpr(rdCounter), src1=1, comment="MBSK CLS (reduction) countdown"))
+        module.add(SCmpEQU32(src0=sgpr(rdCounter), src1=0, comment="CLS reduction loop done?"))
+        module.add(writer.longBranchScc0(rdClsLabel, posNeg=-1, comment="loop while counter != 0"))
+        writer.sgprPool.checkIn(rdGsuM1)
+        writer.sgprPool.checkIn(rdM0Base)
+        writer.sgprPool.checkIn(rdCounter)
 
     def partialWriteBatch(self, writer, kernel, ss, batchIdx, beta, edge, gwvw, batchElements, tmpVgpr, batchElementSgprs, tmpSgpr, codeAccVgprRead, \
                           lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel, clsLoop=False, skipSetup=False):
