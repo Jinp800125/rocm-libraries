@@ -16341,17 +16341,14 @@ class KernelWriterAssembly(KernelWriter):
         naturalNumBatches = max(1, ceilDivide(nElem, numElementsPerBatch))
         _, _naturalIter, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, naturalNumBatches, numElementsPerBatch, gwvw)
         if _naturalIter <= 1:
+        # if _naturalIter:
           elemsPerNGroup = nElem // maxNIter
-          # occupancy-safe budget: VGPR-allowed (numVgprAvailable // numVgprsPerElement)
-          # capped by the SGPR limit; deliberately ignores NEPBS.
-          budget = numVgprAvailable // ss.numVgprsPerElement
-          sgprLim = ss.cfg.numElementsPerBatchLimitedBySgprs
-          if sgprLim and sgprLim > 0:
-            budget = min(budget, sgprLim)
-          budget = max(1, budget)
+          # VGPR/SGPR/even 已收進 numElementsPerBatch；外層 NEPBS=0。只縮小，不重算、不變大。
+          # VGPR/SGPR/even already in numElementsPerBatch; outer NEPBS is 0. Shrink only.
+          budget = min(elemsPerNGroup, max(1, numElementsPerBatch))
           # largest divisor of one N-group that fits the budget (== elemsPerNGroup
           # itself when it fits -> fattest batch, most compaction); min 1.
-          for cand in range(min(elemsPerNGroup, budget), 0, -1):
+          for cand in range(budget, 0, -1):
             if elemsPerNGroup % cand == 0:
               numElementsPerBatch = cand
               break

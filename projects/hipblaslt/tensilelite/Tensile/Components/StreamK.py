@@ -1603,6 +1603,7 @@ class StreamK(Component):
             useCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
                 and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
 
+            clsLabel = clsCounter = clsM0Base = None
             if useCLS:
                 # DEBUG：SK CLS layout / NEPB 調整會寫進 .s。
                 # DEBUG: SK CLS layout / NEPB adjustment dumped into .s.
@@ -1617,28 +1618,26 @@ class StreamK(Component):
                     len(elements[edgeI]), gwvw, str(ss.numVgprsPerElement),
                     str(getattr(ss.cfg, "numElementsPerBatchLimitedBySgprs", "?")),
                     str(kernel["NumElementsPerBatchStore"])))
-                elementsEdge = elements[edgeI]
-                def _emitPartialsBatch(bIdx):
-                    _start = bIdx * numElementsPerBatch
-                    _stop  = min(_start + numElementsPerBatch, len(elementsEdge))
-                    return self.partialsWriteBatch(writer, kernel, ss, bIdx, alpha, beta, edge, gwvw, atomicW, \
-                        elementsEdge[_start:_stop], writer.vgprs.addrD, writer.vgprs.addrC, \
-                        tmpVgpr, cvtVgprStruct, elementSgprs, tmpSgpr, codeAccVgprRead, clsLoop=True)
-                module.add(self._skEmitCLSBatchLoop(writer, kernel, tmpSgpr, clsIter, clsBPB, clsM0Step,
-                        self._skWsOffsetIncrement(writer, kernel), "SK_Partials_CLS", _emitPartialsBatch))
-            else:
-                for batchIdx in range(0, numBatches):
-                    elementStartIdx = batchIdx * numElementsPerBatch
-                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                    elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                    #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
-                    # elementVgprs can be large and should be perfectly tuned to the number of available
-                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                clsCounter, clsM0Base, clsLabel = self._skCLSLoopOpen(
+                    writer, module, tmpSgpr, clsIter, clsM0Step,
+                    self._skWsOffsetIncrement(writer, kernel), "SK_Partials_CLS")
 
-                    module.add(self.partialsWriteBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, gwvw, atomicW, \
-                            elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
-                            tmpVgpr, cvtVgprStruct, \
-                            elementSgprs, tmpSgpr, codeAccVgprRead))
+            elementsEdge = elements[edgeI]
+            for batchIdx in range(clsBPB if useCLS else numBatches):
+                elementStartIdx = batchIdx * numElementsPerBatch
+                elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elementsEdge))
+                elementsThisBatch = elementsEdge[elementStartIdx:elementStopIdx]
+                #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
+                # elementVgprs can be large and should be perfectly tuned to the number of available
+                # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+
+                module.add(self.partialsWriteBatch(writer, kernel, ss, batchIdx, alpha, beta, edge, gwvw, atomicW, \
+                        elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
+                        tmpVgpr, cvtVgprStruct, \
+                        elementSgprs, tmpSgpr, codeAccVgprRead, clsLoop=useCLS))
+
+            if useCLS:
+                self._skCLSLoopClose(writer, module, clsCounter, clsM0Base, clsLabel)
             # delay PreLoopVmcntCase code after globalWrite
             # if self.canOptimizePreLoopLWVmcnt:
             #     kStr += PreLoopVmcntCaseStr
@@ -1772,12 +1771,8 @@ class StreamK(Component):
         from .GlobalWriteBatch import GlobalWriteBatchWriter
         return GlobalWriteBatchWriter.alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge)
 
-    def _skEmitCLSBatchLoop(self, writer, kernel, tmpS01, iterCount, batchesPerBody,
-                            m0Step, increment, labelBase, emitBatch):
-        """SK CLS countdown：一份 body 重跑 iterCount 次。M0 每次 +m0Step；WS offset 跨 iteration 接著加。
-        SK CLS countdown: reuse one body iterCount times. M0 += m0Step each iter; WS offset keeps incrementing.
-        """
-        module = Module("StreamK CLS batch loop")
+    def _skCLSLoopOpen(self, writer, module, tmpS01, iterCount, m0Step, increment, labelBase):
+        """CLS loop preamble + label + per-iter M0 header. Pair with _skCLSLoopClose around the batch for-loop."""
         clsCounter = writer.sgprPool.checkOut(1, tag="SKCLSLoopCounter", preventOverflow=False)
         clsM0Base  = writer.sgprPool.checkOut(1, tag="SKCLSm0Base", preventOverflow=False)
         module.add(SMovB32(dst=sgpr(clsM0Base), src=0, comment="SK CLS M0 base = 0"))
@@ -1792,15 +1787,16 @@ class StreamK(Component):
                            comment="SK CLS M0 = base (v_movrelsd src/dst offset)"))
         module.add(SAddU32(dst=sgpr(clsM0Base), src0=sgpr(clsM0Base), src1=m0Step,
                            comment="SK CLS M0 step (src coef of CLS iter dim)"))
-        for batchIdx in range(0, batchesPerBody):
-            module.add(emitBatch(batchIdx))
+        return clsCounter, clsM0Base, clsLabel
+
+    def _skCLSLoopClose(self, writer, module, clsCounter, clsM0Base, clsLabel):
+        """CLS loop countdown + branch back. Closes a loop opened by _skCLSLoopOpen."""
         module.add(SSubU32(dst=sgpr(clsCounter), src0=sgpr(clsCounter), src1=1, comment="SK CLS countdown"))
         module.add(SCmpEQU32(src0=sgpr(clsCounter), src1=0, comment="CLS loop done?"))
         # 32-bit backward branch: the CLS body can exceed simm16 for large tiles.
         module.add(writer.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
         writer.sgprPool.checkIn(clsM0Base)
         writer.sgprPool.checkIn(clsCounter)
-        return module
 
     def partialsWriteBatch(self, writer, kernel, ss, batchIdx, applyAlpha, beta, edge, gwvw, atomicW, \
             batchElements, addrD, addrC, \
@@ -2253,6 +2249,7 @@ class StreamK(Component):
                     and codeAccVgprRead is not None and codeAccVgprWrite is not None \
                     and kernel["LocalSplitU"] == 1 and not edge
 
+                clsLabel = clsCounter = clsM0Base = None
                 if useCLS:
                     from ..KernelWriterModules import getAccToArchLen
                     module.addComment0("SK CLS (fixup) clsMaxNIter=%u" % GlobalWriteBatchWriter.clsMaxNIter(kernel))
@@ -2261,30 +2258,27 @@ class StreamK(Component):
                         (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
                     module.addComment0("SK CLS (fixup) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
                         (clsBPB, clsIter, clsM0Step))
-                    elementsEdge = elements[edgeI]
-                    def _emitFixupBatch(bIdx):
-                        _start = bIdx * numElementsPerBatch
-                        _stop  = min(_start + numElementsPerBatch, len(elementsEdge))
-                        return self.fixupBatch(writer, kernel, ss, bIdx, edge, gwvw, \
-                            elementsEdge[_start:_stop], writer.vgprs.addrD, writer.vgprs.addrC, \
-                            tmpVgpr, cvtVgprStruct, elementSgprs, tmpSgpr, \
-                            codeAccVgprRead, codeAccVgprWrite, _start, clsLoop=True)
-                    module.add(self._skEmitCLSBatchLoop(writer, kernel, tmpSgpr, clsIter, clsBPB, clsM0Step,
-                            self._skWsOffsetIncrement(writer, kernel), "SK_Fixup_CLS", _emitFixupBatch))
-                else:
-                    for batchIdx in range(0, numBatches):
-                        elementStartIdx = batchIdx * numElementsPerBatch
-                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                        #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
-                        # elementVgprs can be large and should be perfectly tuned to the number of available
-                        # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                    clsCounter, clsM0Base, clsLabel = self._skCLSLoopOpen(
+                        writer, module, tmpSgpr, clsIter, clsM0Step,
+                        self._skWsOffsetIncrement(writer, kernel), "SK_Fixup_CLS")
 
-                        module.add(self.fixupBatch(writer, kernel, ss, batchIdx, edge, gwvw, \
-                                elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
-                                tmpVgpr, cvtVgprStruct, \
-                                elementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite,
-                                elementStartIdx))
+                elementsEdge = elements[edgeI]
+                for batchIdx in range(clsBPB if useCLS else numBatches):
+                    elementStartIdx = batchIdx * numElementsPerBatch
+                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elementsEdge))
+                    elementsThisBatch = elementsEdge[elementStartIdx:elementStopIdx]
+                    #print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,numVgprsPerElement ))
+                    # elementVgprs can be large and should be perfectly tuned to the number of available
+                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+
+                    module.add(self.fixupBatch(writer, kernel, ss, batchIdx, edge, gwvw, \
+                            elementsThisBatch, writer.vgprs.addrD, writer.vgprs.addrC, \
+                            tmpVgpr, cvtVgprStruct, \
+                            elementSgprs, tmpSgpr, codeAccVgprRead, codeAccVgprWrite,
+                            elementStartIdx, clsLoop=useCLS))
+
+                if useCLS:
+                    self._skCLSLoopClose(writer, module, clsCounter, clsM0Base, clsLabel)
                 # delay PreLoopVmcntCase code after globalWrite
                 # if self.canOptimizePreLoopLWVmcnt:
                 #     kStr += PreLoopVmcntCaseStr
