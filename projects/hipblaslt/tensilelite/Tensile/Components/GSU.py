@@ -1051,6 +1051,7 @@ class GSUOn(GSU):
                 pwUseCLS = kernel.get("CompactLoopStore", False) and clsIter > 1 \
                     and codeAccVgprRead is not None and kernel["LocalSplitU"] == 1 and not edge
 
+                clsLabel = clsCounter = clsM0Base = None
                 if pwUseCLS:
                     # busy-wait / label 只發一次，不進 loop body。
                     # Emit busy-wait / labels once, not inside the loop body.
@@ -1062,44 +1063,24 @@ class GSUOn(GSU):
                         (numElementsPerBatchPreCLS, numElementsPerBatch, numBatches))
                     module.addComment0("MBSK CLS (partial write) layout: batchesPerCLSBody=%u iterCount=%u m0Step=%u" %
                         (clsBPB, clsIter, clsM0Step))
-                    clsCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSLoopCounter", preventOverflow=False)
-                    clsM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSm0Base", preventOverflow=False)
-                    module.add(SMovB32(dst=sgpr(clsM0Base), src=0, comment="MBSK CLS M0 base = 0"))
-                    module.add(SMovB32(dst=sgpr(clsCounter), src=clsIter, comment="MBSK CLS loop iter count = %u" % clsIter))
-                    # Serial*bpe 只算一次；乘法暫用 tmpSgpr，隨後設 soffset=0（MBSK 是 store-then-add）。
-                    # Compute Serial*bpe once; tmpSgpr is multiply scratch, then soffset=0 (MBSK is store-then-add).
-                    ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, elements[edgeI][0:numElementsPerBatch], elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
-                    clsAddrDVgpr = ss.elementAddr[0].addrDVgpr
-                    module.add(vectorStaticMultiply(vgpr(clsAddrDVgpr), vgpr("Serial"), kernel["StoreVectorWidth"] * writer.states.bpeCinternal, ContinuousRegister(tmpSgpr.idx, 1)))
-                    module.add(SMovB32(dst=sgpr(tmpSgpr.idx), src=hex(0),
-                                       comment="Init store offset = 0 (body stores then adds inc)"))
-                    clsLabel = Label(writer.labels.getNameInc("MBSK_PartialWrite_CLS"), "")
-                    module.add(clsLabel)
-                    module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0Base), comment="MBSK CLS M0 = base (v_movrelsd src offset)"))
-                    module.add(SAddU32(dst=sgpr(clsM0Base), src0=sgpr(clsM0Base), src1=clsM0Step, comment="MBSK CLS M0 step"))
-                    for bIdx in range(0, clsBPB):
-                        _start = bIdx * numElementsPerBatch
-                        _stop  = min(_start + numElementsPerBatch, len(elements[edgeI]))
-                        # bIdx==0 reuses the ss setup already done in the preamble
-                        # (for the hoisted store-address multiply), so skip re-setup
-                        # to avoid a duplicate vgprValuC checkOut.
-                        module.add(self.partialWriteBatch(writer, kernel, ss, bIdx, beta, edge, gwvw, elements[edgeI][_start:_stop], tmpVgpr, elementSgprs, \
-                                                          tmpSgpr, codeAccVgprRead, lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel, clsLoop=True, skipSetup=(bIdx == 0)))
-                    module.add(SSubU32(dst=sgpr(clsCounter), src0=sgpr(clsCounter), src1=1, comment="MBSK CLS countdown"))
-                    module.add(SCmpEQU32(src0=sgpr(clsCounter), src1=0, comment="CLS loop done?"))
-                    module.add(writer.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
-                    writer.sgprPool.checkIn(clsM0Base)
-                    writer.sgprPool.checkIn(clsCounter)
-                else:
-                    for batchIdx in range(0, numBatches):
-                        elementStartIdx = batchIdx * numElementsPerBatch
-                        elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elements[edgeI]))
-                        elementsThisBatch = elements[edgeI][elementStartIdx:elementStopIdx]
-                        # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
-                        # elementVgprs can be large and should be perfectly tuned to the number of available
-                        # VGPRS.    We do not want to accidentally overflow and grow the pool here:
-                        module.add(self.partialWriteBatch(writer, kernel, ss, batchIdx, beta, edge, gwvw, elementsThisBatch, tmpVgpr, elementSgprs, \
-                                                          tmpSgpr, codeAccVgprRead, lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel))
+                    clsCounter, clsM0Base, clsLabel = self._mbskPartialCLSLoopOpen(
+                        writer, module, kernel, ss, tmpSgpr, elements[edgeI], elementSgprs,
+                        numElementsPerBatch, clsIter, clsM0Step, gwvw)
+
+                elementsEdge = elements[edgeI]
+                for batchIdx in range(clsBPB if pwUseCLS else numBatches):
+                    elementStartIdx = batchIdx * numElementsPerBatch
+                    elementStopIdx = min(elementStartIdx + numElementsPerBatch, len(elementsEdge))
+                    elementsThisBatch = elementsEdge[elementStartIdx:elementStopIdx]
+                    # print("BATCH[%u/%u]: elements[edgeI][%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx, ss.numVgprsPerElement ))
+                    # elementVgprs can be large and should be perfectly tuned to the number of available
+                    # VGPRS.    We do not want to accidentally overflow and grow the pool here:
+                    module.add(self.partialWriteBatch(writer, kernel, ss, batchIdx, beta, edge, gwvw, elementsThisBatch, tmpVgpr, elementSgprs, \
+                                                      tmpSgpr, codeAccVgprRead, lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel,
+                                                      clsLoop=pwUseCLS, skipSetup=(pwUseCLS and batchIdx == 0)))
+
+                if pwUseCLS:
+                    self._mbskCLSLoopClose(writer, module, clsCounter, clsM0Base, clsLabel)
 
                 # synchronize GSUWG in reductionBatch. If is the last WG -> do reduction; else branch to GW_END
                 ss.firstBatch = True
@@ -1266,6 +1247,34 @@ class GSUOn(GSU):
         module.add(SBranch(labelName=reductionBodyLabel.getLabelName(), comment=""))
 
         return module
+
+    def _mbskPartialCLSLoopOpen(self, writer, module, kernel, ss, tmpSgpr, elementsEdge, elementSgprs,
+                                numElementsPerBatch, iterCount, m0Step, gwvw):
+        """MBSK partial-write CLS: preamble + label + per-iter M0 header. Pair with _mbskCLSLoopClose."""
+        clsCounter = writer.sgprPool.checkOut(1, tag="MBSKCLSLoopCounter", preventOverflow=False)
+        clsM0Base  = writer.sgprPool.checkOut(1, tag="MBSKCLSm0Base", preventOverflow=False)
+        module.add(SMovB32(dst=sgpr(clsM0Base), src=0, comment="MBSK CLS M0 base = 0"))
+        module.add(SMovB32(dst=sgpr(clsCounter), src=iterCount, comment="MBSK CLS loop iter count = %u" % iterCount))
+        # Serial*bpe 只算一次；乘法暫用 tmpSgpr，隨後設 soffset=0（MBSK 是 store-then-add）。
+        # Compute Serial*bpe once; tmpSgpr is multiply scratch, then soffset=0 (MBSK is store-then-add).
+        ss.setupStoreElementsForBatchWihoutVgprCheckOut(kernel, gwvw, elementsEdge[0:numElementsPerBatch], elementSgprs, isOptNLL=True, factorDim=0, isWorkspace=True)
+        clsAddrDVgpr = ss.elementAddr[0].addrDVgpr
+        module.add(vectorStaticMultiply(vgpr(clsAddrDVgpr), vgpr("Serial"), kernel["StoreVectorWidth"] * writer.states.bpeCinternal, ContinuousRegister(tmpSgpr.idx, 1)))
+        module.add(SMovB32(dst=sgpr(tmpSgpr.idx), src=hex(0),
+                           comment="Init store offset = 0 (body stores then adds inc)"))
+        clsLabel = Label(writer.labels.getNameInc("MBSK_PartialWrite_CLS"), "")
+        module.add(clsLabel)
+        module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0Base), comment="MBSK CLS M0 = base (v_movrelsd src offset)"))
+        module.add(SAddU32(dst=sgpr(clsM0Base), src0=sgpr(clsM0Base), src1=m0Step, comment="MBSK CLS M0 step"))
+        return clsCounter, clsM0Base, clsLabel
+
+    def _mbskCLSLoopClose(self, writer, module, clsCounter, clsM0Base, clsLabel):
+        """MBSK CLS countdown + branch back. Closes a loop opened by _mbskPartialCLSLoopOpen."""
+        module.add(SSubU32(dst=sgpr(clsCounter), src0=sgpr(clsCounter), src1=1, comment="MBSK CLS countdown"))
+        module.add(SCmpEQU32(src0=sgpr(clsCounter), src1=0, comment="CLS loop done?"))
+        module.add(writer.longBranchScc0(clsLabel, posNeg=-1, comment="loop while counter != 0"))
+        writer.sgprPool.checkIn(clsM0Base)
+        writer.sgprPool.checkIn(clsCounter)
 
     def partialWriteBatch(self, writer, kernel, ss, batchIdx, beta, edge, gwvw, batchElements, tmpVgpr, batchElementSgprs, tmpSgpr, codeAccVgprRead, \
                           lastGsuWgBusyWaitingLabel, reductionBodyLabel, partialWriteLabel, clsLoop=False, skipSetup=False):
