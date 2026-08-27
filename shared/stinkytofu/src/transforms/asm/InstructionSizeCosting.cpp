@@ -200,7 +200,12 @@ inline bool parseLiteralStringToInt(const std::string& s, int32_t& out) {
 ///   4) `src1` (second source) is not a VGPR: e.g. literal, SGPR, or other
 ///   non-`V` register type
 ///      forces the VOP3 form (8 B).
-///   5) VOPC compare: mnemonic `v_cmp_*` (excludes `v_cmpx_*`). If the first
+///   5) Any **source register** carrying a `-` (`isMinus`) or `|abs|`
+///   (`isAbs`) modifier: neither
+///      modifier has a bit in the compact encodings, so the assembler emits
+///      `_e64` (8 B). Negated/abs *inline constants* are folded into the
+///      constant and stay 4 B, hence the `Type::Register` check.
+///   6) VOPC compare: mnemonic `v_cmp_*` (excludes `v_cmpx_*`). If the first
 ///   destination is not
 ///      VCC (e.g. some scalar/flag slot instead of `vcc`), 8 B; with `vcc`
 ///      dest, 4 B.
@@ -234,6 +239,13 @@ int getEffectiveBaseSizeInBytesImpl(const StinkyInstruction& inst) {
             if (!isVCC(lastSrc)) return 8;  // last source not VCC -> promoted to VOP3
         }
         if (srcs.size() >= 2 && !isVGPR(srcs[1])) return 8;  // src1 not VGPR -> promoted to VOP3
+        // Negated / abs register operands on compact VALU promote to VOP3 (e64, 8 B):
+        // neither modifier is encodable outside VOP3.
+        // e.g. v_fmac_f32 v24, -s5, v25 -> v_fmac_f32_e64 on gfx1250 (llvm-mc).
+        for (const StinkyRegister& s : srcs) {
+            if (s.dataType == StinkyRegister::Type::Register && (s.reg.isMinus || s.reg.isAbs))
+                return 8;
+        }
         // VOPC compare v_cmp_* (not v_cmpx_*): dest != vcc -> promoted to VOP3 (8
         // bytes).
         if (isVOPCCompareNonX(mnemonic)) {

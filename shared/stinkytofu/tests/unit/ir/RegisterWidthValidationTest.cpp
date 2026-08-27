@@ -398,6 +398,63 @@ TEST(MUBUFVerificationTest, BufferLoadB32_WrongVdstType_Fails) {
 }
 
 // ==============================================================================
+// m0 as a scalar operand
+//
+// CompactLoopStore drives the v_movrelsd_2_b32 source index through m0
+// (s_mov_b32 m0, s[sgprCLSm0Base]). The SOP1 sdst field is declared as 's', but
+// m0 is encodable in the scalar operand space, so the type check must accept it
+// instead of reporting "has register type 'm', expected 's'".
+// ==============================================================================
+
+namespace {
+/// Populate \p func with a single s_mov_b32 dst, src built from the gfx1250 desc.
+void buildSMovB32(Function& func, const StinkyRegister& dst, const StinkyRegister& src) {
+    GfxArchID arch = getGfxArchID(12, 5, 0);
+    setFunctionArch(func, arch);
+    BasicBlock* bb = func.createBasicBlock("entry");
+    AsmIRBuilder builder(*bb, arch);
+
+    IsaOpcode opcode = getMnemonicToIsaOpcode("s_mov_b32", arch);
+    const HwInstDesc* desc = getMCIDByIsaOp(opcode, arch);
+    assert(desc && "s_mov_b32 not found for gfx1250");
+
+    StinkyInstruction* inst = builder.create(desc);
+    inst->addDestReg(dst);
+    inst->addSrcReg(src);
+}
+
+StinkyRegister mgpr0() {
+    return StinkyRegister("m", 0, 1);
+}
+}  // namespace
+
+// s_mov_b32 m0, s5 — the CLS loop header.
+TEST(M0OperandVerificationTest, SMovB32_M0Dest_Passes) {
+    Function func("kernel");
+    buildSMovB32(func, mgpr0(), sgpr(5));
+    std::string error = validateStinkyIR(func);
+    EXPECT_TRUE(error.empty()) << "s_mov_b32 with m0 dest should pass, got: " << error;
+}
+
+// s_mov_b32 s5, m0 — m0 must be accepted as a scalar source too.
+TEST(M0OperandVerificationTest, SMovB32_M0Src_Passes) {
+    Function func("kernel");
+    buildSMovB32(func, sgpr(5), mgpr0());
+    std::string error = validateStinkyIR(func);
+    EXPECT_TRUE(error.empty()) << "s_mov_b32 with m0 src should pass, got: " << error;
+}
+
+// The scalar relaxation must not leak into VGPR fields.
+TEST(M0OperandVerificationTest, BufferLoadB32_M0Vdst_Fails) {
+    Function func("kernel");
+    buildBufferLoadB32(func, mgpr0(), StinkyRegister("off"), sgpr(4, 4), sgpr(3));
+    std::string error = validateStinkyIR(func);
+    EXPECT_FALSE(error.empty()) << "buffer_load_b32 with m0 vdst should still fail";
+    EXPECT_NE(error.find("dest[0]"), std::string::npos) << "Error should mention dest[0] (vdst)";
+    EXPECT_NE(error.find("'v'"), std::string::npos) << "Error should mention expected type 'v'";
+}
+
+// ==============================================================================
 // VOP3_2SRC shift verification (AIHPBLAS-4142)
 //
 // v_lshrrev_b64 / v_lshlrev_b16 are 2-source VALU shifts. They previously used

@@ -69,6 +69,9 @@ static RegType fieldTypeToRegType(FieldType ft) {
 static bool isScalarRegType(RegType type) {
     switch (type) {
         case RegType::S:
+        // m0 has its own slot in the scalar operand encoding space, so it is a
+        // legal sdst/ssrc (e.g. s_mov_b32 m0, s5 from CompactLoopStore).
+        case RegType::M:
         case RegType::SCC:
         case RegType::VCC:
         case RegType::VCC_LO:
