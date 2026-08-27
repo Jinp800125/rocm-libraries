@@ -84,7 +84,7 @@ class StoreState:
                 self.numMaskSgprPerElement = 0
                 self.numMaskSgprPerBatch   = 0
                 # CLS needs a second temp SGPR so the primer is not clobbered.
-                self.numTempSgprPerBatch = (2 if getattr(kernelWriter.states, 'storeAlign8', False) or kernel["CompactLoopStore"] else 1) * kernelWriter.states.laneSGPRCount
+                self.numTempSgprPerBatch = (2 if getattr(kernelWriter.states, 'storeAlign8', False) or (kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"]) else 1) * kernelWriter.states.laneSGPRCount
             elif ss.optSGPRUsage == 'BufferLoad_Edge_Mask':
                 self.numMaskSgprPerElement = 0
                 self.numMaskSgprPerBatch   = kernelWriter.states.laneSGPRCount

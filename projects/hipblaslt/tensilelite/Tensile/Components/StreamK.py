@@ -1848,6 +1848,9 @@ class StreamK(Component):
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
             # Outside CLS, accVgprRead still uses v_movrelsd_2_b32; stale M0
             # would scramble src. clsLoop: header owns M0 — do not reset.
+            # Non-MI guard not enabled yet: on a VALU kernel M0 holds the prologue
+            # LDS clamp, but no current test runs a non-MI kernel through StreamK.
+            # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not clsLoop:
             if kernel.get("CompactLoopStore", False) and not clsLoop:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
@@ -2379,6 +2382,8 @@ class StreamK(Component):
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
             # Same M0 reset as partials: outside CLS, stale M0 would scramble
             # accVgprRead. clsLoop: header owns M0[9:0] — do not reset.
+            # Non-MI guard not enabled yet (see the partials M0 reset note above).
+            # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not clsLoop:
             if kernel.get("CompactLoopStore", False) and not clsLoop:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
@@ -2599,6 +2604,8 @@ class StreamK(Component):
         #     kStr += inst("s_setprio", "0", "")
         if codeAccVgprWrite is not None and kernel["LocalSplitU"] == 1:
             # CLS write-back: move M0[9:0] (read) up to M0[25:16] (write dst); keep vreg src at 0.
+            # Non-MI guard not enabled yet (see the partials M0 reset note above).
+            # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"]:
             if kernel.get("CompactLoopStore", False):
                 if clsLoop:
                     module.add(SLShiftLeftB32(dst=mgpr(0), src=mgpr(0), shiftHex=16,
@@ -2621,6 +2628,9 @@ class StreamK(Component):
                         #     accVgprRead.addCode(tempStr.replace("ValuC","L2GC"))
 
             # Multi-batch body: restore M0[9:0] for the next accVgprRead.
+            # Non-MI guard not enabled yet (see the partials M0 reset note above);
+            # clsLoop is already False for non-MI, so this one is inert either way.
+            # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and clsLoop:
             if kernel.get("CompactLoopStore", False) and clsLoop:
                 module.add(SLShiftRightB32(dst=mgpr(0), src=mgpr(0), shiftHex=16,
                     comment="M0[25:16] -> M0[9:0]: restore acc src index for next batch's read"))

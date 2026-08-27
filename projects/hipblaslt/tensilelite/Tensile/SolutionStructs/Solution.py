@@ -2628,6 +2628,11 @@ class Solution(collections.abc.Mapping):
       if not isaInfoMap[isa].asmCaps["HasMovRelsD2B32"]:
         reject(state, printRejectionReason, "This arch does not support CompactLoopStore (no v_movrelsd_2_b32)")
         return
+      # Alternative to the per-site EnableMatrixInstruction guards: drop CLS for
+      # non-MI (VALU) kernels here instead, so every CLS site takes the baseline
+      # path from one place.
+      # if not state["EnableMatrixInstruction"]:
+      #   state["CompactLoopStore"] = False
 
     # MX scale layout + transport derivation and validation. See
     # _deriveAndValidateMXScaleLayoutAndTransport for the full set of rules.
