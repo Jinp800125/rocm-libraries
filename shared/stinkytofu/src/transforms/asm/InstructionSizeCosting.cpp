@@ -222,6 +222,11 @@ int getEffectiveBaseSizeInBytesImpl(const StinkyInstruction& inst) {
             if (!isVCC(lastSrc)) return 8;  // last source not VCC -> promoted to VOP3
         }
         if (srcs.size() >= 2 && !isVGPR(srcs[1])) return 8;  // src1 not VGPR -> promoted to VOP3
+        // Negated register operands on compact VALU promote to VOP3 (e64, 8 B).
+        // e.g. v_fmac_f32 v24, -s5, v25 -> v_fmac_f32_e64 on gfx1250 (llvm-mc).
+        for (const StinkyRegister& s : srcs) {
+            if (s.dataType == StinkyRegister::Type::Register && s.reg.isMinus) return 8;
+        }
         // VOPC compare v_cmp_* (not v_cmpx_*): dest != vcc -> promoted to VOP3 (8
         // bytes).
         if (isVOPCCompareNonX(mnemonic)) {
