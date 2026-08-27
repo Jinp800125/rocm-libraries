@@ -72,6 +72,8 @@ static bool isScalarRegType(RegType type) {
         case RegType::S:
         // FieldType::sreg_m0 means "an sreg or m0", and fieldTypeToRegType folds it
         // to RegType::S, so the actual m0 register has to be accepted here too.
+        // m0 has its own slot in the scalar operand encoding space, so it is a
+        // legal sdst/ssrc (e.g. s_mov_b32 m0, s5 from CompactLoopStore).
         case RegType::M:
         case RegType::SCC:
         case RegType::VCC:

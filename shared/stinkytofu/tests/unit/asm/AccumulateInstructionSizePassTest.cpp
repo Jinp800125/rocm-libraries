@@ -35,6 +35,18 @@ StinkyRegister litStr(const char* s) {
     r.literalValue.assign(s);
     return r;
 }
+
+StinkyRegister sgprMinus(int idx, int num = 1) {
+    StinkyRegister r("s", idx, num);
+    r.reg.isMinus = 1;
+    return r;
+}
+
+StinkyRegister vgprAbs(int idx, int num = 1) {
+    StinkyRegister r("v", idx, num);
+    r.reg.isAbs = 1;
+    return r;
+}
 }  // namespace
 
 class InstructionSizeCostingTest : public ::testing::Test {
@@ -827,4 +839,40 @@ TEST_F(InstructionSizeCostingTest, Accumulate_LabelOffsetsUnaffectedByFenceCount
     EXPECT_EQ(none.second, many.second);
     EXPECT_EQ(none.first["label_A"], many.first["label_A"]);
     EXPECT_EQ(none.first["label_B"], many.first["label_B"]);
+}
+
+
+TEST_F(InstructionSizeCostingTest, VFmacF32_NegatedSgprSrc0_PromotesTo8Bytes) {
+    auto b = makeBuilder();
+    const HwInstDesc* d = getMCIDByUOp(GFX::v_fmac_f32, arch);
+    ASSERT_NE(d, nullptr);
+    StinkyInstruction* neg = b.create(d);
+    neg->addDestReg(StinkyRegister("v", 24, 1));
+    neg->addSrcReg(sgprMinus(5, 1));
+    neg->addSrcReg(StinkyRegister("v", 25, 1));
+    EXPECT_EQ(getEffectiveBaseSizeInBytes(*neg), 8);
+
+    StinkyInstruction* pos = b.create(d);
+    pos->addDestReg(StinkyRegister("v", 24, 1));
+    pos->addSrcReg(StinkyRegister("s", 5, 1));
+    pos->addSrcReg(StinkyRegister("v", 25, 1));
+    EXPECT_EQ(getEffectiveBaseSizeInBytes(*pos), 4);
+}
+
+// Both sources are VGPRs, so only the abs modifier can force e64 here.
+TEST_F(InstructionSizeCostingTest, VFmacF32_AbsVgprSrc0_PromotesTo8Bytes) {
+    auto b = makeBuilder();
+    const HwInstDesc* d = getMCIDByUOp(GFX::v_fmac_f32, arch);
+    ASSERT_NE(d, nullptr);
+    StinkyInstruction* abs = b.create(d);
+    abs->addDestReg(StinkyRegister("v", 24, 1));
+    abs->addSrcReg(vgprAbs(5, 1));
+    abs->addSrcReg(StinkyRegister("v", 25, 1));
+    EXPECT_EQ(getEffectiveBaseSizeInBytes(*abs), 8);
+
+    StinkyInstruction* plain = b.create(d);
+    plain->addDestReg(StinkyRegister("v", 24, 1));
+    plain->addSrcReg(StinkyRegister("v", 5, 1));
+    plain->addSrcReg(StinkyRegister("v", 25, 1));
+    EXPECT_EQ(getEffectiveBaseSizeInBytes(*plain), 4);
 }
