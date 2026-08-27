@@ -454,7 +454,7 @@ class GlobalWriteBatchWriter:
     # CompactLoopStore CLS countdown tail: emit countdown + branch + s_endpgm at
     # END of the CLS-loop body (= last batch of batchesPerCLSBody). Gated by
     # CompactLoopStore so non-CLS .s matches baseline (no CLS tail emit).
-    if self.kernel["CompactLoopStore"]:
+    if self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"]:
       #     updateCoord1 = (edge or multi-packed)
       if self.direct_next_rowInc != 0 and self.ss.elementAddr:
         kw = self.parentWriter
@@ -800,6 +800,9 @@ class GlobalWriteBatchWriter:
     # Primer SGPRs for delayed incrementToNextRow (NonEdge / optSrdIncForRow).
     module.add(SMovB32(dst=sgpr(self.tmpS01),   src=0, comment="Init sgpr offset"))
     module.add(SMovB32(dst=sgpr(self.tmpS01+1), src=0, comment="Init sgpr offset"))
+    # Non-MI guard not enabled yet: StoreRemapVectorWidth is 0 in every test that
+    # exercises a VALU store, so this path is unverified for non-MI.
+    # if self.kernel["StoreRemapVectorWidth"] and self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"]:
     if self.kernel["StoreRemapVectorWidth"] and self.kernel["CompactLoopStore"]:
       # Batch 0 checks out; later batches reuse parentWriter.compactLoopStoreVgpr.
       self.CompactLoopStoreVgpr = self.parentWriter.vgprPool.checkOut(1, tag="CompactLoopStoreVgpr_tmpVgpr")
@@ -830,7 +833,7 @@ class GlobalWriteBatchWriter:
     precomputed by KernelWriterAssembly; 0 on the last batch). Returns 0 when
     there is no override (non-CLS, no elementAddr, or no further advance).
     """
-    if not (self.kernel["CompactLoopStore"] and self.ss.elementAddr):
+    if not (self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"] and self.ss.elementAddr):
       return 0
     for _j in range(elementIdx + 1, len(self.batchElements)):
       _ri = self.ss.elementAddr[_j].rowInc
@@ -842,13 +845,13 @@ class GlobalWriteBatchWriter:
     """Scratch sgpr for epilogue address math.
     CLS: extra pool sgpr so the primer in tmpS01 is not clobbered. Non-CLS: reuse tmpSgpr.
     """
-    if self.kernel["CompactLoopStore"]:
+    if self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"]:
       return self.parentWriter.sgprPool.checkOutAligned(n, 1)
     return self.tmpSgpr
 
   def _epilogScratchFree(self, sgprIdx):
     """Release scratch from _epilogScratchSgpr (no-op when non-CLS reused tmpSgpr)."""
-    if self.kernel["CompactLoopStore"]:
+    if self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"]:
       self.parentWriter.sgprPool.checkIn(sgprIdx)
 
   def _prolog(self, module: Module):
@@ -950,7 +953,7 @@ class GlobalWriteBatchWriter:
     # label + M0 assignment + M0 step. Wrapped in `if CompactLoopStore` as a
     # unit so non-CLS .s emits ONLY the original module.addComment2(commentStr)
     # in the else branch (matches baseline)
-    if self.kernel["CompactLoopStore"] and self.batchIdx == 0:
+    if self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"] and self.batchIdx == 0:
       self._emitElt0LdsPreambleBeforeBanner(module, None, #bufferOOB,
                                              loadInputCode,
                                              factor_gwvw)
@@ -1011,7 +1014,7 @@ class GlobalWriteBatchWriter:
       _emitOverrideRows = self._lookaheadRowInc(elementIdx)
 
       tmpInrSgpr = self._epilogScratchSgpr(1)
-      _skipCrossBatchAdv = (self.kernel["CompactLoopStore"] and elementIdx == 0 and self.batchIdx > 0)
+      _skipCrossBatchAdv = (self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"] and elementIdx == 0 and self.batchIdx > 0)
       module.add(addrCalc.emitAddressSetupCode(self.kernel, self.tPB, self.ss, self.tmpVgpr, tmpInrSgpr, self.edge, self.beta, self.atomic, elementIdx, addrDVgpr,
                                                skipCrossBatchAdvance=_skipCrossBatchAdv))
       self._epilogScratchFree(tmpInrSgpr)
@@ -1242,6 +1245,8 @@ class GlobalWriteBatchWriter:
           module.add(self.getEdgeMovInstType()(EXEC(), -1, "full mask -1 -> exec"))
 
       if self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel":
+        # Non-MI guard not enabled yet (StoreRemap path, see _emitElt0Lds... above).
+        # if self.ss.optSrdIncForRow and (addrCalc.rowInc or (self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"] and elementIdx == 0 and self.batchIdx == 0)) and self.kernel["StoreRemapVectorWidth"] > 0:
         if self.ss.optSrdIncForRow and (addrCalc.rowInc or (self.kernel["CompactLoopStore"] and elementIdx == 0 and self.batchIdx == 0)) and self.kernel["StoreRemapVectorWidth"] > 0:
           module.addComment1("StoreRemap: shift coord1 address MultipleBufferSingleKernel")
           if self.kernel["ProblemType"]["UseE"] and (self.kernel["GlobalSplitU"] == 1 or self.kernel["GlobalSplitU"] == -1):
@@ -1779,6 +1784,8 @@ class GlobalWriteBatchWriter:
       # Already write wave column block into LDS
       # Now read lds data back to registers and write to global memroy
       if self.kernel["_GlobalAccumulation"] != "MultipleBufferSingleKernel":
+        # Non-MI guard not enabled yet (StoreRemap path, see _emitElt0Lds... above).
+        # if self.ss.optSrdIncForRow and (addrCalc.rowInc or (self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"] and elementIdx == 0 and self.batchIdx == 0)) and self.kernel["StoreRemapVectorWidth"] > 0:
         if self.ss.optSrdIncForRow and (addrCalc.rowInc or (self.kernel["CompactLoopStore"] and elementIdx == 0 and self.batchIdx == 0)) and self.kernel["StoreRemapVectorWidth"] > 0:
           module.addComment1("StoreRemap: shift coord1 address")
           if self.kernel["ProblemType"]["UseE"] and (self.kernel["GlobalSplitU"] == 1 or self.kernel["GlobalSplitU"] == -1):
@@ -1788,6 +1795,8 @@ class GlobalWriteBatchWriter:
           module.add(addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01, forceinitrow0=1, overrideAfterPrimerRows=_emitOverrideRows))
 
           # CLS delayed primer: apply primed rows, then store the next look-ahead.
+          # Non-MI guard not enabled yet (StoreRemap path, see _emitElt0Lds... above).
+          # if self.kernel["CompactLoopStore"] and self.kernel["EnableMatrixInstruction"] and _emitOverrideRows:
           if self.kernel["CompactLoopStore"] and _emitOverrideRows:
             module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.CompactLoopStoreVgpr), "shift storeRemap coord1"))
             module.add(VMovB32(vgpr(self.CompactLoopStoreVgpr), _emitOverrideRows, comment="set shift rows"))

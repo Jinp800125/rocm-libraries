@@ -1301,6 +1301,10 @@ class GSUOn(GSU):
             (ss.optSingleColVgpr, ss.optSharedColVgpr, ss.optSGPRUsage, ss.optSrdIncForRow))
 
         # Zero M0 outside the loop. clsLoop: header owns M0 — do not reset.
+        # Non-MI guard not enabled yet: on a VALU kernel M0 holds the prologue LDS
+        # clamp, so this reset is actively harmful there, but no current test runs
+        # a non-MI kernel through MBSK.
+        # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not clsLoop:
         if kernel.get("CompactLoopStore", False) and not clsLoop:
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
@@ -1552,6 +1556,8 @@ class GSUOn(GSU):
                 module.add(SCmpGtI32(src0=sgpr(tmpSgpr.idx), src1=self.gsuThreshold, comment="GSU > %u ?" % self.gsuThreshold))
                 module.add(SCBranchSCC1(labelName=accvgprWriteLabel.getLabelName(), comment="branch if true"))
                 module.addComment("GSU <= %u, do accvgpr_read for the last gsu wg" % self.gsuThreshold)
+                # Non-MI guard not enabled yet (see the M0 reset note above).
+                # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"]:
                 if kernel.get("CompactLoopStore", False):
                     if clsLoop and clsM0BaseSgpr is not None:
                         # accvgpr READ: acc is src via M0[9:0]; keep M0[25:16]=0.
@@ -1572,6 +1578,8 @@ class GSUOn(GSU):
         # accvgpr write
         module.add(accvgprWriteLabel)
         module.addComment("accvgpr write")
+        # Non-MI guard not enabled yet (see the M0 reset note above).
+        # if kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"]:
         if kernel.get("CompactLoopStore", False):
             if clsLoop and clsM0BaseSgpr is not None:
                 # Write: M0[25:16] from rdM0Base (do not keep the read M0).

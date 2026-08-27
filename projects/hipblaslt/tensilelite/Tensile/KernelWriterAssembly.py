@@ -16314,7 +16314,7 @@ class KernelWriterAssembly(KernelWriter):
 
     # Dedicated CLS SGPRs (do not reuse WorkGroup2 / ArgType; they are still live).
     # CLSm0Base = M0 src offset; CLSLoopCounter = countdown.
-    if kernel["CompactLoopStore"]:
+    if kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"]:
       edgeModule.add(self.defineSgpr("CLSm0Base", 1))
       edgeModule.add(self.defineSgpr("CLSLoopCounter", 1))
 
@@ -16547,7 +16547,7 @@ class KernelWriterAssembly(KernelWriter):
       edgeModule.add(actLoopEndLabel)
 
     # Free dedicated CLS SGPRs after all batches / activation branches.
-    if kernel["CompactLoopStore"]:
+    if kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"]:
       edgeModule.add(self.undefineSgpr("CLSLoopCounter"))
       edgeModule.add(self.undefineSgpr("CLSm0Base"))
 
@@ -16973,7 +16973,7 @@ class KernelWriterAssembly(KernelWriter):
           addr0 = vgpr(addrCalc.addrDVgpr,2)
           addr1 = ""
         # CLS: also seed the SRD chain on elt0/batch0 (rowInc==0).
-        if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and elementIdx == 0 and batchIdx == 0))):
+        if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"] and elementIdx == 0 and batchIdx == 0))):
           module.add(addrCalc.incrementToNextRow(kernel, "D", ss, tmpS01, forceinitrow0=1,
                                                  overrideAfterPrimerRows=overrideAfterPrimerRows))
 
@@ -16994,6 +16994,9 @@ class KernelWriterAssembly(KernelWriter):
           addr0 = vgpr(addrCalc.addrGSUSyncVgprs,2)
           addr1 = ""
         # First CLS store (elt0/batch0) must prime SrdTD even when rowInc==0.
+        # Non-MI guard not enabled yet: no current test reaches the TD (workspace)
+        # store on a VALU kernel.
+        # if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"] and elementIdx == 0 and batchIdx == 0))):
         if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and elementIdx == 0 and batchIdx == 0))):
           module.add(addrCalc.incrementToNextRow(kernel, "TD", ss, tmpS01, forceinitrow0=1,
                                                  overrideAfterPrimerRows=overrideAfterPrimerRows))
@@ -17132,8 +17135,8 @@ class KernelWriterAssembly(KernelWriter):
 
     isWorkspace = tc == 'WS'
     # CLS: seed the SRD chain on elt0/batch0. C uses tmpS01+1 so D's primer is kept.
-    if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and elementIdx == 0 and batchIdx == 0))) and not isWorkspace:
-      _stmp = (tmpS01 + 1) if (tc == 'C' and kernel["CompactLoopStore"]) else tmpS01
+    if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"] and elementIdx == 0 and batchIdx == 0))) and not isWorkspace:
+      _stmp = (tmpS01 + 1) if (tc == 'C' and kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"]) else tmpS01
       module.add(addrCalc.incrementToNextRow(kernel, tc, ss, _stmp, forceinitrow0=1, bpeType=bpeType,
                                              overrideAfterPrimerRows=overrideAfterPrimerRows))
 
