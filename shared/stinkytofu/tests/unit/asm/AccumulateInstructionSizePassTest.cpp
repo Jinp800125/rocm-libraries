@@ -34,6 +34,12 @@ StinkyRegister litStr(const char* s) {
     r.literalValue.assign(s);
     return r;
 }
+
+StinkyRegister sgprMinus(int idx, int num = 1) {
+    StinkyRegister r("s", idx, num);
+    r.reg.isMinus = 1;
+    return r;
+}
 }  // namespace
 
 class InstructionSizeCostingTest : public ::testing::Test {
@@ -560,4 +566,21 @@ TEST_F(InstructionSizeCostingTest, SMovB32_Hex40800000_StillPlus4_NotValuF32Rule
     inst->addSrcReg(litStr("0x40800000"));
 
     EXPECT_EQ(getLiteralExtraBytes(*inst), 4);
+}
+
+TEST_F(InstructionSizeCostingTest, VFmacF32_NegatedSgprSrc0_PromotesTo8Bytes) {
+    auto b = makeBuilder();
+    const HwInstDesc* d = getMCIDByUOp(GFX::v_fmac_f32, arch);
+    ASSERT_NE(d, nullptr);
+    StinkyInstruction* neg = b.create(d);
+    neg->addDestReg(StinkyRegister("v", 24, 1));
+    neg->addSrcReg(sgprMinus(5, 1));
+    neg->addSrcReg(StinkyRegister("v", 25, 1));
+    EXPECT_EQ(getEffectiveBaseSizeInBytes(*neg), 8);
+
+    StinkyInstruction* pos = b.create(d);
+    pos->addDestReg(StinkyRegister("v", 24, 1));
+    pos->addSrcReg(StinkyRegister("s", 5, 1));
+    pos->addSrcReg(StinkyRegister("v", 25, 1));
+    EXPECT_EQ(getEffectiveBaseSizeInBytes(*pos), 4);
 }
