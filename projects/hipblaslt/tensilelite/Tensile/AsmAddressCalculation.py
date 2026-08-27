@@ -985,8 +985,9 @@ class AddrCalculation:
                                     comment="incToNextRow(%u): Scale by BPE"%(nr)))
                     return sc
 
-                # Non-CLS: stride before s_add.
-                if not kernel["CompactLoopStore"]:
+                # Non-CLS: stride before s_add. The delayed primer below is only
+                # valid for MI kernels (see CLS notes), so non-MI stays here too.
+                if not (kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"]):
                     module.add(_buildStrideCompute(numRows))
 
                 if dst == -1:
@@ -1017,7 +1018,7 @@ class AddrCalculation:
 
                 # CLS: stride after s_add (primes next call). overrideAfterPrimerRows
                 # is the next emitting elt's rowInc; else fall back to this elt's numRows.
-                if kernel["CompactLoopStore"]:
+                if kernel["CompactLoopStore"] and kernel["EnableMatrixInstruction"]:
                     primerRows = overrideAfterPrimerRows if overrideAfterPrimerRows else numRows
                     module.add(_buildStrideCompute(primerRows))
 
