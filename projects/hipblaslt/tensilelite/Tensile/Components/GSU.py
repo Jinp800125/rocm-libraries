@@ -1552,10 +1552,19 @@ class GSUOn(GSU):
                 module.add(SCmpGtI32(src0=sgpr(tmpSgpr.idx), src1=self.gsuThreshold, comment="GSU > %u ?" % self.gsuThreshold))
                 module.add(SCBranchSCC1(labelName=accvgprWriteLabel.getLabelName(), comment="branch if true"))
                 module.addComment("GSU <= %u, do accvgpr_read for the last gsu wg" % self.gsuThreshold)
-                if clsLoop and clsM0BaseSgpr is not None:
-                    # accvgpr READ: acc is src via M0[9:0]; keep M0[25:16]=0.
-                    module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0BaseSgpr),
-                        comment="MBSK CLS (reduction) M0[9:0] = acc src offset for accvgpr read"))
+                if kernel.get("CompactLoopStore", False):
+                    if clsLoop and clsM0BaseSgpr is not None:
+                        # accvgpr READ: acc is src via M0[9:0]; keep M0[25:16]=0.
+                        module.add(SMovB32(dst=mgpr(0), src=sgpr(clsM0BaseSgpr),
+                            comment="MBSK CLS (reduction) M0[9:0] = acc src offset for accvgpr read"))
+                    elif clsLoop:
+                        # Header already set M0; do not zero it.
+                        pass
+                    else:
+                        # Outside a CLS loop M0 still holds the prologue LDS clamp, whose
+                        # low bits would offset the v_movrelsd_2_b32 acc source index.
+                        module.add(SMovB32(dst=mgpr(0), src=0,
+                            comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
                 module.add(self.lastGsuWgReduction(kernel, writer, ss, batchIdx, tmpVgpr, tmpVgprDynamic, gwvw, batchElements, \
                                                codeAccVgprRead, addrCalc.globalOffset, addrCalc.addrDVgpr))
 
