@@ -2689,7 +2689,7 @@ class KernelWriterAssembly(KernelWriter):
       if kernel["GlobalSplitU"] != 0 or kernel["AdaptiveGemmNTAB"] != 0:
         moduleRegInit.add(SAndB32(dst=sgpr("GSU"), src0=sgpr(sgprPackedArgs), src1=hex(0xFFFF), comment="Restore GSUConfig and GSU"))
 
-      if kernel["ProblemType"]["SupportUserArgs"]:
+      if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
         moduleRegInit.add(SMovB32(dst=sgpr("ArgType"),src=sgpr(sgprArgType)))
 
     self.sgprPool.checkIn(sgprPackedArgs)
@@ -3270,7 +3270,7 @@ class KernelWriterAssembly(KernelWriter):
     if self.states.groOffsetInMacroTile and not kernel["UseSubtileImpl"]:
       # Added logic to check for Pointer Array case (ArgType==3) and not prepad the double pointer addresses
       Skip_Address_Prepad_For_Pointer_Array = Label(label="Skip_Address_Prepad_For_Pointer_Array", comment="Skip pre-padding of address for pointer array case")
-      if kernel["ProblemType"]["SupportUserArgs"]:
+      if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
         self.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
         module.add(SCBranchSCC1(labelName=Skip_Address_Prepad_For_Pointer_Array.getLabelName()))
       if not kernel["enableTDMA"]:
@@ -4826,7 +4826,7 @@ class KernelWriterAssembly(KernelWriter):
           stride = "Stride%s%s"%(tc,self.states.indexChars[tP['ia'][i]])
           stridedBatchedGemmLoad = Label(label=self.labels.getNameInc("StridedBatchedGemmLoad"+tc), comment="Computing the Batch Matrix's base address for Strided Batched GEMM")
           stridedBatchedGemmLoad_End = Label(label=self.labels.getNameInc("StridedBatchedGemmLoad"+tc+"_End"), comment="End Computing the Batch Matrix's base address for Strided Batched")
-          if kernel["ProblemType"]["SupportUserArgs"]:
+          if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
             self.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
             module.add(SCBranchSCC0(labelName=stridedBatchedGemmLoad.getLabelName()))
           else:
@@ -13724,7 +13724,7 @@ class KernelWriterAssembly(KernelWriter):
     SrdTDGeneralBatched = Label(label="SrdTDInit_GeneralBatched", comment="")
     SrdTDGeneralBatched_End = Label(label="SrdTDInit_GeneralBatched_End", comment="")
 
-    if kernel["ProblemType"]["SupportUserArgs"]:
+    if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
       self.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
       module.add(SCBranchSCC1(labelName=SrdTDGeneralBatched.getLabelName(), comment="Initializing General Batched GEMM SrdTD differently"))
 
@@ -14003,7 +14003,7 @@ class KernelWriterAssembly(KernelWriter):
     RegularSrdInitialization = Label(label="RegularSrdInitialization"+ch, comment="Regular SRD initialization for non-General Batched GEMM for "+ch)
     gsuComponent = Component.GSU.find(self)
     module.add(gsuComponent.initializeSrd(self, ArgTypeCheckLabel, GeneralBatchedGemmSrdInitiation_End, kernel, ch))
-    if kernel["ProblemType"]["SupportUserArgs"]:
+    if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
       self.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
       module.add(SCBranchSCC0(labelName=RegularSrdInitialization.getLabelName()))
       # Check for StreamK Kernel when ArgType == 3 (General Batched GEMM)

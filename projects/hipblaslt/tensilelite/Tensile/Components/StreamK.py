@@ -2823,7 +2823,7 @@ class StreamK(Component):
     
     def stridedBatchOrGeneralBatch(self, writer, stridedBatchedGemmLoad, generalBatchedGemmLoad, kernel):
         module = Module("StreamK stridedBatchOrGeneralBatch")
-        if kernel["ProblemType"]["SupportUserArgs"]:
+        if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
             writer.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
             module.add(SCBranchSCC0(labelName=stridedBatchedGemmLoad.getLabelName())) 
             # Check for StreamK Kernel when ArgType == 3 (General Batched GEMM)

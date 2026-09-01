@@ -2385,13 +2385,13 @@ class GSUOn(GSU):
             module.add(SCBranchSCC0(labelName=argTypeChecks.getLabelName()))
         else:
             module.add(SCBranchSCC0(labelName=stridedBatchedGemmLoad.getLabelName()))
-        if kernel["ProblemType"]["SupportUserArgs"]:
+        if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
             writer.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
             module.add(SCBranchSCC1(labelName=generalBatchedGemmLoad.getLabelName())) 
         if(kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel' and mat == "C"):
             module.add(SBranch(labelName=stridedBatchedGemmLoad.getLabelName()))
             module.add(argTypeChecks)
-            if kernel["ProblemType"]["SupportUserArgs"]:
+            if 1:#if kernel["ProblemType"]["SupportUserArgs"]:
                 writer.cmpNamedArgTypeEq(module, 3, "ArgType == 3 for General Batched GEMM")
                 module.add(SCBranchSCC1(labelName=generalBatchedGemmLoad.getLabelName()))
                 module.add(SBranch(labelName=stridedBatchedGemmLoad.getLabelName()))  
