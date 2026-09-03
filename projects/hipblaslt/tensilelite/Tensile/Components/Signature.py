@@ -353,17 +353,28 @@ class SignatureDefault(Signature):
         # signature.offset counts from the very first arg including the common header.
         # The assembly loads these args with KernArgAddress already advanced past
         # that header by commonArgsSize, so subtract it.
-        if not kernel["ProblemType"]["GroupedGemm"]:
-            commonArgsSize = userArgumentsInfo.commonArgsSize
-            writer.states.batchOffsetDKernArgOffset = signature.offset - commonArgsSize
-            signature.addArg("batchOffsetD", SVK.SIG_VALUE, "u64")
-            writer.states.batchOffsetCKernArgOffset = signature.offset - commonArgsSize
-            signature.addArg("batchOffsetC", SVK.SIG_VALUE, "u64")
-            writer.states.batchOffsetAKernArgOffset = signature.offset - commonArgsSize
-            signature.addArg("batchOffsetA", SVK.SIG_VALUE, "u64")
-            writer.states.batchOffsetBKernArgOffset = signature.offset - commonArgsSize
-            signature.addArg("batchOffsetB", SVK.SIG_VALUE, "u64")
-            userArgumentsInfo.gemmArgumentSize += 32  # 4 offsets * 8 bytes each
+        #
+        # Declared unconditionally, including for GroupedGemm, so that the emitted
+        # assembly does not depend on GroupedGemm -- getKeyNoInternalArgs() masks
+        # that flag to dedup grouped and non-grouped kernels into one code object.
+        # Grouped gemm never dispatches with ArgType == 3, so the loads guarded by
+        # that runtime check are simply unreachable there.
+        #
+        # These are deliberately NOT added to gemmArgumentSize: that counter mirrors
+        # the fixed public hipblaslt_ext::UserArguments struct, and its total is used
+        # as the per-gemm stride when grouped gemm walks the user args array
+        # (KernelWriterAssembly, "offset address from args_start to gemm_start").
+        # UserArguments has no batch offset fields, so including them would skew
+        # that stride.
+        commonArgsSize = userArgumentsInfo.commonArgsSize
+        writer.states.batchOffsetDKernArgOffset = signature.offset - commonArgsSize
+        signature.addArg("batchOffsetD", SVK.SIG_VALUE, "u64")
+        writer.states.batchOffsetCKernArgOffset = signature.offset - commonArgsSize
+        signature.addArg("batchOffsetC", SVK.SIG_VALUE, "u64")
+        writer.states.batchOffsetAKernArgOffset = signature.offset - commonArgsSize
+        signature.addArg("batchOffsetA", SVK.SIG_VALUE, "u64")
+        writer.states.batchOffsetBKernArgOffset = signature.offset - commonArgsSize
+        signature.addArg("batchOffsetB", SVK.SIG_VALUE, "u64")
 
         activationType = ActivationType("all")
         for name in activationType.getAdditionalArgStringList():
