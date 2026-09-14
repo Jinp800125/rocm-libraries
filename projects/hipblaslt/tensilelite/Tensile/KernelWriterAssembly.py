@@ -8815,6 +8815,30 @@ class KernelWriterAssembly(KernelWriter):
     return mappedIdx, scaleSel
 
   ##############################################################################
+  # MXS KSpan scale-select
+  #
+  # [中文] KSpan 把 unroll iteration 2g 和 2g+1 配成一對：LocalRead 只會為偶數那個
+  # local-read buffer 發一條 ds_load，而那條 load 的上半個 wave 裝的就是奇數那個
+  # iteration 要用的 MFMA-K step。這個函式負責把「原本的 local-read buffer index」
+  # 轉成「實際上真的有被載入的那個 buffer」，並回傳對應的 scale-select
+  # （0 = 本 K step，在下半 wave；1 = 下一個 K step，在上半 wave）。
+  # 也就是 m -> (m 取偶數, m 的奇偶位元)。
+  #
+  # KSpan pairs unroll iterations 2g and 2g+1: LocalRead issues one ds_load for the
+  # even local-read buffer whose upper half-wave holds the odd iteration's MFMA-K
+  # step. Map a local-read buffer index to the buffer that was actually loaded plus
+  # the scale-select (0 = this K step, 1 = the next one in the upper half-wave).
+  ##############################################################################
+  def mxsKSpanBufferSel(self, kernel, tP, m):
+    tc = tP["tensorChar"]
+    if "MXS" not in tc or self.states.inTailLoop or not self.mxsUsesScaleSel(kernel):
+      return m, 0
+    component = Component.LocalRead.find(self)
+    if component.getMxsKSpanInfo(kernel, tc, tP["tile01Idx"], self.states.asmCaps) is None:
+      return m, 0
+    return m - (m % 2), m % 2
+
+  ##############################################################################
   # MAC Iteration
   ##############################################################################
   def macIter(self, kernel, tPA, tPB, bufferIdx, iuiCount, useMacro, isTail=False):
@@ -9692,13 +9716,21 @@ class KernelWriterAssembly(KernelWriter):
           mxsbScaleSel = 0
           if kernel["ProblemType"]["MXBlockA"]:
             mxsaIdx, mxsaScaleSel = self.mxsTileSpanScaleSel(kernel, tPA["MX"], idxA)
-            mxsaStr_base = self.generateSrcStrForMFMA(kernel, tPA["MX"], innerUnroll, vregSetIdx, vgprPerInputMXSA, m, u, iui, mxsaIdx)
+            # [中文] TileSpan 和 KSpan 都是在花用上半個 wave，兩者最多只會有一個生效，
+            # 所以這裡用 max 把兩邊算出來的 scale-select 併起來是安全的
+            # （不生效的那一邊固定回傳 0）。
+            # TileSpan and KSpan both spend the upper half-wave, so at most one is active.
+            mxsaM, mxsaScaleSelK = self.mxsKSpanBufferSel(kernel, tPA["MX"], m)
+            mxsaScaleSel = max(mxsaScaleSel, mxsaScaleSelK)
+            mxsaStr_base = self.generateSrcStrForMFMA(kernel, tPA["MX"], innerUnroll, vregSetIdx, vgprPerInputMXSA, mxsaM, u, iui, mxsaIdx)
             mxsaStr = vgpr(mxsaStr_base, vgprPerInputMXSA)
           else:
             mxsaStr = vgpr("ValuMXSDummy") if kernel["ProblemType"]["MXBlockB"] == 32 else vgpr("ValuMXSDummy",2)
           if kernel["ProblemType"]["MXBlockB"]:
             mxsbIdx, mxsbScaleSel = self.mxsTileSpanScaleSel(kernel, tPB["MX"], idxB)
-            mxsbStr_base = self.generateSrcStrForMFMA(kernel, tPB["MX"], innerUnroll, vregSetIdx, vgprPerInputMXSB, m, u, iui, mxsbIdx)
+            mxsbM, mxsbScaleSelK = self.mxsKSpanBufferSel(kernel, tPB["MX"], m)
+            mxsbScaleSel = max(mxsbScaleSel, mxsbScaleSelK)
+            mxsbStr_base = self.generateSrcStrForMFMA(kernel, tPB["MX"], innerUnroll, vregSetIdx, vgprPerInputMXSB, mxsbM, u, iui, mxsbIdx)
             mxsbStr = vgpr(mxsbStr_base, vgprPerInputMXSB)
           else:
             mxsbStr = vgpr("ValuMXSDummy") if kernel["ProblemType"]["MXBlockA"] == 32 else vgpr("ValuMXSDummy",2)

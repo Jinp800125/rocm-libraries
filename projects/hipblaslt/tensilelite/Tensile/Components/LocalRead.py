@@ -214,6 +214,124 @@ class LocalReadMFMA(LocalRead):
             "numGroups": miWaveTileVectors // 2,
         }
 
+    @staticmethod
+    def getMxsKSpanInfo(kernel, tc, tile01, asmCaps):
+        """
+        [中文說明]
+        MX scale 的 KSpan scale-select：TileSpan 是沿著 tile 軸吃掉上半個 wave，KSpan 則是
+        沿著 unroll (K) 軸做同一件事。
+
+        WMMA 16x16x128 搭配 MXBlock 32，代表每 32 個 K element 共用一個 F8 scale，所以一條
+        WMMA 的 A（或 B）需要 16*128/32 = 64 個 F8 = 16 個 register。一個 wave 只要
+        MatrixInstM（== WavefrontSize/2 == 16）條 lane 就能湊滿這 16 個 register，因此現在
+        scale ds_load 的上半個 wave（lane 16~31）載的是跟下半個 wave 一模一樣的東西，整整
+        浪費一半的頻寬。
+
+        KSpan 的做法是讓上半個 wave 改去載「下一個 MFMA-K step」的 scale。這樣一條 ds_load
+        就能同時餵飽連續兩個 unroll iteration：偶數那次用 matrix_{a,b}_scale:0 讀下半 wave，
+        奇數那次用 matrix_{a,b}_scale:1 讀上半 wave。MX scale 的 ds_load 因此砍半：
+
+            改之前                               改之後
+            ds_load MXA (iter0 / iter0)          ds_load MXA (iter0 / iter1)
+            ds_load MXB (iter0 / iter0)          ds_load MXB (iter0 / iter1)
+            wmma D A B D MXA MXB                 wmma D A B D MXA MXB   (scale:0)
+            ds_load MXA (iter1 / iter1)          wmma D A B D MXA MXB   (scale:1)
+            ds_load MXB (iter1 / iter1)
+            wmma D A B D MXA MXB
+
+        本函式與軸無關（由 tile01 決定 tile 軸），MXSA / MXSB 兩個 tensor 共用。條件都滿足就
+        回傳 layout info，否則回傳 None。
+
+        為什麼需要 LoopIters >= 4：
+        一對 iteration 讀的是同一塊 VGPR，所以「重新填那塊 VGPR 的 ds_load」不能排在上一個
+        DepthU 對該 VGPR 的最後一個 consumer 前面。照標準的 buffer 輪替
+        （plrIdx = (u + numItersPLR) % LoopIters，pair base = plrIdx & ~1），在
+        u = LoopIters-1 載入的那一對會在「下一個 DepthU」的 u = 0 與 u = 1 被消費，只有
+        LoopIters-1 > 1 時才安全。所以 LoopIters == 2 不能用 KSpan：它整個 loop body 只有
+        一對，下一輪 DepthU 的 ds_load 會在本次 iteration 的 WMMA 還在讀的時候就把它蓋掉
+        （實測放寬這個 gate 之後 validation 會 FAILED）。
+
+        MX scale KSpan scale-select: the sibling of TileSpan along the unroll (K) axis.
+
+        A whole wave only needs MatrixInstM (== WavefrontSize/2) lanes to supply one MFMA-K
+        step of MX scales, so the upper half-wave of every scale ds_load is currently a
+        duplicate of the lower half. When DepthU spans several MFMA-K steps, load the *next*
+        K step into that upper half instead: one ds_load then feeds two consecutive unroll
+        iterations, the even iteration reading it with matrix_{a,b}_scale:0 and the odd one
+        with matrix_{a,b}_scale:1. That halves the MX scale ds_loads.
+        Axis-neutral (tile01 selects the tile axis, so this serves either MX scale tensor).
+        Return the KSpan layout info, or None.
+
+        The consuming WMMA reads the same VGPR for both iterations of a pair, so the pair's
+        ds_load must not land in the loop body before the previous DepthU's last consumer of
+        that VGPR. With the standard rotation (buffer plrIdx = (u + numItersPLR) % LoopIters,
+        pair base = plrIdx & ~1) the pair loaded at u = LoopIters-1 is consumed at u = 0, 1 of
+        the *next* DepthU, which is safe only when LoopIters-1 > 1. LoopIters == 2 therefore
+        cannot use KSpan: its single pair would be overwritten by the next DepthU's ds_load
+        while the current iteration's WMMAs are still reading it.
+        """
+        if "MXS" not in tc:
+            return None
+        # [中文] 架構與 layout 的門檻，跟 TileSpan 完全一樣：KSpan 需要 LDS 上是
+        # InMemorySwizzle 的 scale 排法，而且硬體要有 gfx1250 WMMA_V3 的 matrix_*_scale
+        # 選擇器（參考 KernelWriterAssembly.mxsUsesScaleSel）。
+        # Same arch/format gate as TileSpan: KSpan needs the InMemorySwizzle scale layout in
+        # LDS and the gfx1250 WMMA_V3 matrix_*_scale select (see KernelWriterAssembly.
+        # mxsUsesScaleSel).
+        if kernel.get("ISA") != (12, 5, 0) \
+                or not asmCaps.get("HasWMMA_V3", False) \
+                or kernel.get("MXScaleFormat") != "InMemorySwizzle":
+            return None
+        # [中文] scale-select 是在 lane i 和 lane i+halfSpan 之間二選一，所以上下兩半必須
+        # 剛好切在 wave 的中點上，也就是 tile 方向的 MatrixInst 維度要等於 WavefrontSize/2。
+        # The scale-select picks lane i vs lane i+halfSpan, so the two halves must meet at the
+        # wave midpoint.
+        matrixInstT = kernel["MatrixInstM"] if (tile01 == 0) else kernel["MatrixInstN"]
+        if matrixInstT != kernel["WavefrontSize"] // 2:
+            return None
+        # [中文] TileSpan 已經把上半個 wave 拿去放 partner tile block 了，兩個優化搶的是同一
+        # 份資源，不能同時開。TileSpan 優先。
+        # TileSpan already spends the upper half-wave on the partner tile block; the two
+        # optimizations cannot share it.
+        if LocalReadMFMA.getMxsTileSpanInfo(kernel, tc, tile01, asmCaps) is not None:
+            return None
+        # [中文] DepthU 要涵蓋偶數個 MFMA-K step 才能兩兩配對；另外上面 docstring 說明的
+        # VGPR 生命週期問題要求同時至少有兩對在飛，所以 LoopIters 必須 >= 4。
+        # DepthU must cover an even number of MFMA-K steps to pair them up, and the pair
+        # lifetime above needs at least two pairs in flight.
+        loopIters = kernel["LoopIters"]
+        if loopIters < 4 or (loopIters % 2) != 0:
+            return None
+        # [中文] 配對的 base 是從 local-read buffer index 推出來的，只有「一個 iteration 對應
+        # 一個 buffer」時（ClusterLocalRead）這個 index 才等同於 unroll iteration。
+        # The pair base is derived from the local-read buffer index, which only tracks the
+        # unroll iteration when there is one buffer per iteration.
+        if not kernel["ClusterLocalRead"]:
+            return None
+        # [中文] 以下幾個都會打亂 buffer index 與 unroll iteration 的一對一關係，或是走不同的
+        # local read 路徑，先一律排除。
+        if kernel["InnerUnroll"] != 1 or kernel["LocalSplitU"] != 1:
+            return None
+        if kernel["ForceUnrollSubIter"] or kernel["numSubTiles"] > 1:
+            return None
+        if kernel["DirectToVgpr%s" % tc] or kernel["ProblemType"]["Sparse"]:
+            return None
+        # [中文] K step 是以一個常數的形式直接折進 local-read address（見 LraTileAssignment），
+        # 所以 LDS padding 不能去擾動這個位移。
+        # The K step is folded into the local-read address as a constant, so LDS padding must
+        # not perturb it.
+        if kernel["LdsPad%s" % tc] or kernel["LdsBlockSizePerPad%s" % tc]:
+            return None
+
+        mxUnit = kernel["MatrixInstK"] // kernel["ProblemType"]["MXBlock%s" % tc[3]]
+        return {
+            # [中文] LDS 上相鄰兩個 MFMA-K step 的 MX scale 相距幾個 byte。這個值必須和
+            # KernelWriterAssembly.localReadInc 每個 iteration 推進的 localReadOffset 一致。
+            # Bytes between two consecutive MFMA-K steps of MX scales in LDS, matching the
+            # per-iteration localReadOffset step in KernelWriterAssembly.localReadInc.
+            "kStride": kernel["MacroTile%s" % tc] * mxUnit,
+        }
+
     # Vreg Value layout (assuming MIInputPerThread = 8)
     # (1) local read dst
     #       T: index transpose case (lrvwTile>1 and not transposeCode)
@@ -618,6 +736,19 @@ class LocalReadMFMA(LocalRead):
         tile01           = tP["tile01Idx"]
         instruction      = tP["localReadInstruction"]
         bpr              = 4 # bytes/register
+
+        # [中文] KSpan 把 buffer 2g（偶數，用 matrix_*_scale:0）和 buffer 2g+1（奇數，用
+        # scale:1）配成一對，兩者的資料都來自「為偶數 buffer 發出的那一條 ds_load」——它的
+        # 上半個 wave 裝的就是奇數 buffer 需要的那個 K step（見 LraTileAssignment）。
+        # 因此奇數 buffer 這邊什麼都不發。注意 localReadInc 對奇數 buffer 還是照跑，正是這樣
+        # 才能讓下一對的 LDS offset 落在正確的位置上。
+        # KSpan pairs buffer 2g (even, matrix_*_scale:0) with buffer 2g+1 (odd, scale:1): both
+        # come from the single ds_load issued for the even buffer, whose upper half-wave holds
+        # the odd buffer's K step (see LraTileAssignment). Emit nothing for the odd buffer.
+        # localReadInc still runs for it, which is what keeps the next pair's LDS offset right.
+        if not writer.states.inTailLoop and (bufferIdx % 2) == 1 \
+                and self.getMxsKSpanInfo(kernel, tc, tile01, writer.states.asmCaps) is not None:
+            return imod, pack, packPre
 
         vectorWidth      = kernel["VectorWidth%s"%tc]
         mxUnit: int      = kernel["MatrixInstK"] // kernel["ProblemType"][f"MXBlock{mxTc}"]

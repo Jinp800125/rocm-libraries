@@ -698,6 +698,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
   # that all necessary dependency are met.  The driver code in kernelBody
   # blindly follows the plan set in unrollLoopHeaderCode and perIterCode
   ##############################################################################
+  # [中文] 一條 MX scale ds_load 能服務幾個 unroll iteration：這個 tensor 有開 KSpan
+  # scale-select 時是 2（見 LocalRead.getMxsKSpanInfo），沒開就是 1。
+  # 用途是換算 s_wait_dscnt 時要把「已發出的 MX scale local read 條數」除以這個倍率。
+  #
+  # Number of unroll iterations served by a single MX scale ds_load: 2 when the KSpan
+  # scale-select is active for this tensor (see LocalRead.getMxsKSpanInfo), else 1.
+  ##############################################################################
+  def mxsKSpanFactor(self, kernel, tc):
+    if self.states.inTailLoop or not kernel["ProblemType"]["MXBlock%s" % tc[3]]:
+      return 1
+    tile01 = 1 if kernel["ProblemType"]["Index01%s" % tc] else 0
+    getInfo = getattr(Component.LocalRead.find(self), "getMxsKSpanInfo", None)
+    return 2 if (getInfo and getInfo(kernel, tc, tile01, self.states.asmCaps)) else 1
+
   def makeSchedule(self, kernel, tensorParametersA, tensorParametersB, localWriteEndIter, skipGlobalReadInc=False, firstIter=False, lastLoop=False, lastLc=False, isNGLL=False):
 
     self.codes.unrollLoopHeader = Module()
@@ -2557,6 +2571,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
         readFactorB = 2 if (tPB["localReadInstruction"].blockWidth == 6) else 1
         localReadsA = 0 if kernel["DirectToVgprA"] else self.states.numReadsPerIterA * skipReadsIterA * readFactorA
         localReadsB = 0 if kernel["DirectToVgprB"] else self.states.numReadsPerIterB * skipReadsIterB * readFactorB
+        # [中文] KSpan 是每「一對」unroll iteration 才發一條 MX scale ds_load，所以被跳過的
+        # 那些 iteration 裡只有一半真的帶著 read。這裡的整數除法會往下取整，往下取整只會讓
+        # dscnt 變小（= 等更多筆 read 回來），不管落在奇數還是偶數那一邊都仍然是安全的。
+        # 注意 ScheduleIterAlg 4（StinkyTofu）會自己依相依性重算 waitcnt，這段是給
+        # SIA 0~3 的解析式路徑用的。
+        # KSpan issues one MX scale ds_load per *pair* of unroll iterations, so only half of
+        # the skipped iterations actually carry a read. Rounding down can only shrink dscnt,
+        # i.e. wait for more reads to land, which stays correct whichever parity we land on.
+        skipReadsIterMXSA //= self.mxsKSpanFactor(kernel, "MXSA")
+        skipReadsIterMXSB //= self.mxsKSpanFactor(kernel, "MXSB")
         localReadsMXSA = 0 if ((not kernel["ProblemType"]["MXBlockA"]) or kernel["DirectToVgprMXSA"]) else self.states.numReadsPerIterMXSA * skipReadsIterMXSA
         localReadsMXSB = 0 if ((not kernel["ProblemType"]["MXBlockB"]) or kernel["DirectToVgprMXSB"]) else self.states.numReadsPerIterMXSB * skipReadsIterMXSB
         localReadsMetadata = self.states.numReadsPerIterMetadata * skipReadsIterMetadata if hasMetadata else 0

@@ -770,6 +770,14 @@ class LraTileAssignmentMFMA(LraTileAssignment):
         #     hiOffset path below explicitly places the partner block into the upper half-wave.
         tileSpan = LocalRead.find(writer).getMxsTileSpanInfo(kernel, tc, tile01, writer.states.asmCaps) is not None
         tileSpanWaveSplit = tileSpan and (kernel["MIWaveGroup"][tile01] > 1)
+        # [中文] KSpan 是 TileSpan 在 unroll 軸上的對應版本，搶的是同一個上半 wave，所以
+        # TileSpan 有開的時候 getMxsKSpanInfo 一定回傳 None。這裡的判斷條件必須和
+        # LocalRead.localReadMX（負責跳過每一對的奇數 buffer）完全一致，否則位址和實際發出
+        # 的 ds_load 會對不起來。
+        # KSpan is the unroll-axis counterpart of TileSpan and claims the same upper half-wave,
+        # so getMxsKSpanInfo returns None whenever TileSpan is on. It must match
+        # LocalRead.localReadMX (which skips the odd buffer of each pair) exactly.
+        kSpanInfo = LocalRead.find(writer).getMxsKSpanInfo(kernel, tc, tile01, writer.states.asmCaps)
 
         waveWidth        = writer.states.kernel["WavefrontSize"]
 
@@ -1082,6 +1090,22 @@ class LraTileAssignmentMFMA(LraTileAssignment):
                         comment="8. (TileSpan wave-split) hi = (tid / MI_dim) & 1  (lower/upper half-wave)"))
                     module.add(vectorStaticMultiplyAdd(vgpr(tReg), vgpr(dummy), hiOffset, vgpr(tReg), tmpSgprInfo, \
                         "8. (TileSpan wave-split) wave offset in %s dimen: wOffset += hi * hiOffset(%u); upper half-wave grabs partner block" % (tileDim, hiOffset)))
+            if kSpanInfo is not None:
+                # [中文] KSpan 的位址計算：讓上半個 wave（lane 16~31）去讀下一個 MFMA-K step
+                # 的 scale，於是一條 ds_load 就涵蓋了一對偶/奇 unroll iteration，WMMA 再用
+                # matrix_{a,b}_scale 去挑自己要的那個 step。kStride 就是一個 MFMA-K step 的
+                # scale 在 LDS 上佔的 byte 數。
+                # 產生出來的三條指令等同於：lrOffset += ((tid / MI_dim) & 1) * kStride
+                # KSpan: the upper half-wave reads the next MFMA-K step's scales, so one
+                # ds_load covers an even/odd unroll-iteration pair and the WMMA picks the step
+                # with matrix_{a,b}_scale. kStride = one MFMA-K step of scales in bytes.
+                kStride = kSpanInfo["kStride"]
+                module.add(vectorStaticDivide(dummy, dividendReg, matrixInstTO, tmpVgprRes, \
+                    "8. (KSpan) hiSel = tid / MI_dim(%u)" % matrixInstTO))
+                module.add(VAndB32(dst=vgpr(dummy), src0=1, src1=vgpr(dummy), \
+                    comment="8. (KSpan) hi = (tid / MI_dim) & 1  (lower/upper half-wave)"))
+                module.add(vectorStaticMultiplyAdd(vgpr(tReg), vgpr(dummy), kStride, vgpr(tReg), tmpSgprInfo, \
+                    "8. (KSpan) unroll offset: lrOffset += hi * kStride(%u); upper half-wave grabs next MFMA-K step" % kStride))
             if perpBlockSize > 0:
                writer.vgprPool.checkIn(rotVgpr)
 
