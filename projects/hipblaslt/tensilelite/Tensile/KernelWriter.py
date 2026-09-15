@@ -712,6 +712,21 @@ class KernelWriter(metaclass=abc.ABCMeta):
     getInfo = getattr(Component.LocalRead.find(self), "getMxsKSpanInfo", None)
     return 2 if (getInfo and getInfo(kernel, tc, tile01, self.states.asmCaps)) else 1
 
+  ##############################################################################
+  # [中文] LoopIters == 2 開 KSpan 時，一對 iteration 共用同一塊 VGPR，所以下一個 DepthU
+  # 的 MX scale ds_load 不能照常排在 MFMA 前面（那會在奇數 iteration 的 WMMA 還要讀舊值
+  # 時就把它蓋掉）。回傳 True 代表這個 kernel 必須把 MX scale 的 local read 挪到 MFMA
+  # 之後。LoopIters >= 4 時有兩對以上在飛，照標準輪替就已經安全，不需要延後。
+  #
+  # With LoopIters == 2 a KSpan pair is the loop body's only pair, so the next DepthU's MX
+  # scale ds_load must move after the MFMAs instead of preceding them. LoopIters >= 4 keeps
+  # two pairs in flight and is already safe under the standard rotation.
+  ##############################################################################
+  def mxsKSpanDeferLocalRead(self, kernel):
+    if self.states.inTailLoop or kernel["LoopIters"] != 2:
+      return False
+    return self.mxsKSpanFactor(kernel, "MXSA") > 1 or self.mxsKSpanFactor(kernel, "MXSB") > 1
+
   def makeSchedule(self, kernel, tensorParametersA, tensorParametersB, localWriteEndIter, skipGlobalReadInc=False, firstIter=False, lastLoop=False, lastLc=False, isNGLL=False):
 
     self.codes.unrollLoopHeader = Module()
@@ -989,6 +1004,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
         iterCode.addItems(macItems)
       else:
         if(kernel["PrefetchGlobalRead"] >= 2):
+          # [中文] KSpan + LoopIters == 2：把 MX scale 的 local read 從這裡抽出來，改排到
+          # macIterCode 之後，否則它會蓋掉本輪 WMMA 還要用 scale:1 讀的那塊 VGPR。
+          # KSpan + LoopIters == 2: pull the MX scale local reads out of the pre-MFMA slot and
+          # re-emit them after macIterCode, or they clobber the VGPR this iteration's scale:1
+          # WMMAs still read.
+          deferredMXSReadCode = Module("deferredMXSLocalRead")
+          if self.mxsKSpanDeferLocalRead(kernel):
+            keptItems = []
+            for item in localReadCode.items():
+              if item.name and item.name.startswith("LocalReadDoMXS"):
+                deferredMXSReadCode.add(item)
+              else:
+                keptItems.append(item)
+            localReadCode.setItems(keptItems)
           iterCode.add(waitLWCode)
           iterCode.add(syncCode)
           iterCode.add(localReadCode)
@@ -1007,6 +1036,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
           iterCode.add(packPreCode)
           iterCode.add(packCode)
           iterCode.add(macIterCode)
+          iterCode.add(deferredMXSReadCode)
         else:
           iterCode.add(globalReadCode)
           iterCode.add(waitLWCode)

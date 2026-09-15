@@ -242,14 +242,16 @@ class LocalReadMFMA(LocalRead):
         本函式與軸無關（由 tile01 決定 tile 軸），MXSA / MXSB 兩個 tensor 共用。條件都滿足就
         回傳 layout info，否則回傳 None。
 
-        為什麼需要 LoopIters >= 4：
+        LoopIters 的限制：
         一對 iteration 讀的是同一塊 VGPR，所以「重新填那塊 VGPR 的 ds_load」不能排在上一個
         DepthU 對該 VGPR 的最後一個 consumer 前面。照標準的 buffer 輪替
         （plrIdx = (u + numItersPLR) % LoopIters，pair base = plrIdx & ~1），在
         u = LoopIters-1 載入的那一對會在「下一個 DepthU」的 u = 0 與 u = 1 被消費，只有
-        LoopIters-1 > 1 時才安全。所以 LoopIters == 2 不能用 KSpan：它整個 loop body 只有
-        一對，下一輪 DepthU 的 ds_load 會在本次 iteration 的 WMMA 還在讀的時候就把它蓋掉
-        （實測放寬這個 gate 之後 validation 會 FAILED）。
+        LoopIters-1 > 1 時才安全，所以 LoopIters >= 4 不需要額外處理。
+        LoopIters == 2 整個 loop body 只有一對，照標準排程那條 ds_load 會落在奇數 iteration
+        的 WMMA 前面、把還要讀的舊值蓋掉。這個情況改用
+        KernelWriter.mxsKSpanDeferLocalRead 把 MX scale 的 local read 延後到 MFMA 之後，
+        目前只有 _ScheduleIterAlg == 0 搭配 PGR >= 2 的排程路徑有做，其餘路徑仍然不支援。
 
         MX scale KSpan scale-select: the sibling of TileSpan along the unroll (K) axis.
 
@@ -266,9 +268,12 @@ class LocalReadMFMA(LocalRead):
         ds_load must not land in the loop body before the previous DepthU's last consumer of
         that VGPR. With the standard rotation (buffer plrIdx = (u + numItersPLR) % LoopIters,
         pair base = plrIdx & ~1) the pair loaded at u = LoopIters-1 is consumed at u = 0, 1 of
-        the *next* DepthU, which is safe only when LoopIters-1 > 1. LoopIters == 2 therefore
-        cannot use KSpan: its single pair would be overwritten by the next DepthU's ds_load
-        while the current iteration's WMMAs are still reading it.
+        the *next* DepthU, which is safe without further work when LoopIters >= 4.
+        LoopIters == 2 has a single pair, so its ds_load would otherwise be scheduled ahead of
+        the odd iteration's WMMAs and clobber the value they still read. That case is handled
+        by deferring the MX scale local read past the MFMAs (see
+        KernelWriter.mxsKSpanDeferLocalRead), which only the _ScheduleIterAlg == 0 + PGR >= 2
+        schedule implements.
         """
         if "MXS" not in tc:
             return None
@@ -295,13 +300,27 @@ class LocalReadMFMA(LocalRead):
         # optimizations cannot share it.
         if LocalReadMFMA.getMxsTileSpanInfo(kernel, tc, tile01, asmCaps) is not None:
             return None
-        # [中文] DepthU 要涵蓋偶數個 MFMA-K step 才能兩兩配對；另外上面 docstring 說明的
-        # VGPR 生命週期問題要求同時至少有兩對在飛，所以 LoopIters 必須 >= 4。
-        # DepthU must cover an even number of MFMA-K steps to pair them up, and the pair
-        # lifetime above needs at least two pairs in flight.
+        # [中文] DepthU 要涵蓋偶數個 MFMA-K step 才能兩兩配對。LoopIters >= 4 時同時有兩對
+        # 以上在飛，照標準輪替就安全；LoopIters == 2 只有一對，要靠下面那段的 local read
+        # 延後才安全。
+        # DepthU must cover an even number of MFMA-K steps to pair them up. LoopIters >= 4
+        # keeps two pairs in flight and is safe under the standard rotation; LoopIters == 2
+        # has a single pair and relies on the deferred local read handled below.
         loopIters = kernel["LoopIters"]
-        if loopIters < 4 or (loopIters % 2) != 0:
+        if (loopIters % 2) != 0:
             return None
+        if loopIters < 4:
+            # [中文] LoopIters == 2 整個 loop body 只有一對，下一個 DepthU 的 ds_load 必須被
+            # 延後到本輪最後一個 consumer（奇數 iteration 的 WMMA）之後才安全。只有
+            # _ScheduleIterAlg == 0（ScheduleIterAlg 0 與 4 都會 remap 到這裡）搭配
+            # PGR >= 2 的排程路徑有實作這個延後，見 KernelWriter.mxsKSpanDeferLocalRead。
+            # LoopIters == 2 has a single pair, so the next DepthU's ds_load has to be
+            # deferred past the odd iteration's WMMAs. Only the _ScheduleIterAlg == 0
+            # (ScheduleIterAlg 0 and 4 both remap here) + PGR >= 2 schedule implements that.
+            if loopIters != 2 \
+                    or kernel.get("_ScheduleIterAlg") != 0 \
+                    or kernel["PrefetchGlobalRead"] < 2:
+                return None
         # [中文] 配對的 base 是從 local-read buffer index 推出來的，只有「一個 iteration 對應
         # 一個 buffer」時（ClusterLocalRead）這個 index 才等同於 unroll iteration。
         # The pair base is derived from the local-read buffer index, which only tracks the
