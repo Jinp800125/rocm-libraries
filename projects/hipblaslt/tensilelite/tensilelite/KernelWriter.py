@@ -7285,11 +7285,6 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
         self._dcpAdvanceTokens("Tensor")
       module.add(self.closeLoop(kernel, tensorParametersA, tensorParametersB, i, True))
 
-    # Drop GlobalReadIncs* from the free pool so endSummation's store-phase SRDs don't
-    # re-check-out an already-grabbed slot.
-    for grIncName in ("GlobalReadIncsA", "GlobalReadIncsB", "GlobalReadIncsMXSA", "GlobalReadIncsMXSB"):
-      self.removeSgprVarFromPool(grIncName)
-
     module.add(self.endSummation(kernel, tensorParametersA, tensorParametersB))
     if isPersistent(kernel):
       module.add(Component.TileProcessingStrategy.find(self).skipPhantomTileStore(self, kernel))
