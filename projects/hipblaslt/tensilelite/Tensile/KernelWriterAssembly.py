@@ -8373,6 +8373,17 @@ class KernelWriterAssembly(KernelWriter):
       module.addComment0("endSummation: add vgpr [%u...%u) to pool" % \
                         (vbegin, vbegin+vsize))
 
+    # Wave-separated TDM parks GlobalReadIncs* in freeSgprVarPool
+    # (releaseGlobalReadIncsSgprsAfterTdmWaveSep) and removeGROffsetsVariableSgprsFromPool
+    # is skipped for that config, so nothing unparks them. A parked name keeps its slot
+    # Available, so the store phase hands it out as a temp while defineSgpr still tries to
+    # re-pin every parked name -- which then fails. Drop them at the summation/post-loop
+    # boundary, which precedes every store path (kernelBody, kernelBodySubtile, and the
+    # OptNLL store emitted from closeSumAtLeastUnroll), so the release walk below frees
+    # them for real.
+    for grIncName in ("GlobalReadIncsA", "GlobalReadIncsB", "GlobalReadIncsMXSA", "GlobalReadIncsMXSB"):
+      self.removeSgprVarFromPool(grIncName)
+
     keptSgprs = []
     # FP32 to FP8 SR without v_prng_b32 needs RNDSeed sgpr preserved
     if kernel["ProblemType"]["DestDataType"].is8bitFloat() and kernel["ProblemType"]["StochasticRounding"] and not self.states.asmCaps["v_prng_b32"]:
