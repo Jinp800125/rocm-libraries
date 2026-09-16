@@ -1007,7 +1007,7 @@ class GSUOn(GSU):
             numElementsPerBatchPreCLS = numElementsPerBatch
             if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"]:
                 numElementsPerBatch = GlobalWriteBatchWriter.alignNEPBForCLS(
-                    kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge)
+                    kernel, len(elements[edgeI]), numElementsPerBatch, gwvw, edge, flatWorkspaceWalk=True)
             numBatches = max(1, ceilDivide(len(elements[edgeI]), numElementsPerBatch))
 
             numSgprs = ss.cfg.numTempSgprPerBatch + ss.cfg.numMaskSgprPerBatch + ss.cfg.numMaskSgprPerElement * numElementsPerBatch
