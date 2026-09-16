@@ -2135,7 +2135,7 @@ class StreamK(Component):
 
     def _skAlignNEPBForCLS(self, kernel, nElem, numElementsPerBatch, gwvw, edge):
         from .GlobalWriteBatch import GlobalWriteBatchWriter
-        return GlobalWriteBatchWriter.alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge)
+        return GlobalWriteBatchWriter.alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge, flatWorkspaceWalk=True)
 
     def _skCLSLoopOpen(self, writer, module, tmpS01, iterCount, m0Step, increment, labelBase):
         """CLS loop preamble + label + per-iter M0 header. Pair with _skCLSLoopClose around the batch for-loop."""

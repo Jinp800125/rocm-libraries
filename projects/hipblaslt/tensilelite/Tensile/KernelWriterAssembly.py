@@ -16349,39 +16349,10 @@ class KernelWriterAssembly(KernelWriter):
     # Not used for atomic / StoreRemap / subtile.
     if kernel["CompactLoopStore"] and not kernel["NumElementsPerBatchStore"] and kernel["EnableMatrixInstruction"] \
         and not atomic and not kernel["StoreRemapVectorWidth"] and not kernel.get("UseSubtileImpl") \
-        and ss.numVgprsPerElement > 0 \
-        and not GlobalWriteBatchWriter.clsEpilogVectorLoopUnsafe(kernel, ss.factorDim):
-      maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
-      nElem = len(element)
-      if maxNIter > 1 and nElem % maxNIter == 0:
-        # TODO: `if _naturalIter` is always true; use `<= 1` to skip already-looping kernels.
-        naturalNumBatches = max(1, ceilDivide(nElem, numElementsPerBatch))
-        _, _naturalIter, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, naturalNumBatches, numElementsPerBatch, gwvw, factorDim=ss.factorDim)
-        # if _naturalIter <= 1:
-        if _naturalIter:
-          elemsPerNGroup = nElem // maxNIter
-          # Shrink only; VGPR/SGPR/even already in numElementsPerBatch.
-          budget = min(elemsPerNGroup, max(1, numElementsPerBatch))
-          # Largest N-group divisor that fits the budget.
-          # half/bf16 pack two elements per 32b register (setupStoreElementsForBatch
-          # pairs data vgpr as (ei, ei+1)), so an odd batch mis-pairs the last element.
-          # Skip odd cand unless gwvw already makes the ValuC count even.
-          # Mirrors GlobalWriteBatchWriter.alignNEPBForCLS.
-          # needsEven is commented out (experiment); alignNEPBForCLS still checks it.
-          # cdt = kernel["ProblemType"]["ComputeDataType"]
-          # needsEven = (cdt.isHalf() or cdt.isBFloat16()) and ((gwvw % 2) == 1)
-          # largest divisor of one N-group that fits the budget (== elemsPerNGroup
-          # itself when it fits -> fattest batch, most compaction); min 1.
-          for cand in range(budget, 0, -1):
-            if elemsPerNGroup % cand == 0:
-              numElementsPerBatch = cand
-              break
-            # if elemsPerNGroup % cand != 0:
-            #   continue
-            # if needsEven and cand > 1 and (cand % 2) != 0:
-            #   continue
-            # numElementsPerBatch = cand
-            # break
+        and ss.numVgprsPerElement > 0:
+      # refineOccupancy sizes the shared non-edge batch; edge batches are re-derived later.
+      numElementsPerBatch = GlobalWriteBatchWriter.alignNEPBForCLS(
+          kernel, len(element), numElementsPerBatch, gwvw, edge=False, factorDim=ss.factorDim)
 
     numBatches = max(1, ceilDivide(len(element),numElementsPerBatch))
 

@@ -389,20 +389,32 @@ class GlobalWriteBatchWriter:
                                kernel["ProblemType"].get("UseScaleAlphaVec", 0))
 
   @staticmethod
-  def alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge):
+  def alignNEPBForCLS(kernel, nElem, numElementsPerBatch, gwvw, edge, factorDim=0, flatWorkspaceWalk=False):
     """
     Shrink NEPB to the largest N-group divisor that still fits the existing VGPR budget.
+
+    Single implementation of the shrink: refineOccupancy (the main store path) and
+    the GSU / StreamK workspace paths all come through here. The loop-feasibility
+    gating mirrors computeCLSLayout, so NEPB is never shrunk for a loop that
+    computeCLSLayout will then refuse to form.
     """
     if not (kernel.get("CompactLoopStore", False) and kernel["EnableMatrixInstruction"] and not edge):
+      return numElementsPerBatch
+    # Same gate as computeCLSLayout: flatWorkspaceWalk stores raw accumulators, so
+    # it reads no epilogue vector.
+    if not flatWorkspaceWalk and GlobalWriteBatchWriter.clsEpilogVectorLoopUnsafe(kernel, factorDim):
       return numElementsPerBatch
     maxNIter = GlobalWriteBatchWriter.clsMaxNIter(kernel)
     if maxNIter <= 1 or nElem % maxNIter != 0:
       return numElementsPerBatch
     elemsPerNGroup = nElem // maxNIter
-    # half/bf16 pack two elements per 32b register, so a batch must be even
-    # unless gwvw already makes the ValuC count even.
+    # half/bf16 pack two elements per 32b register (setupStoreElementsForBatch pairs
+    # data vgpr as (ei, ei+1)), so an odd batch mis-pairs the last element unless
+    # gwvw already makes the ValuC count even.
     cdt = kernel["ProblemType"]["ComputeDataType"]
     needsEven = (cdt.isHalf() or cdt.isBFloat16()) and ((gwvw % 2) == 1)
+    # Largest divisor of one N-group that fits the budget (== elemsPerNGroup itself
+    # when it fits -> fattest batch, most compaction); min 1.
     budget = min(elemsPerNGroup, max(1, numElementsPerBatch))
     for cand in range(budget, 0, -1):
       if elemsPerNGroup % cand != 0:
