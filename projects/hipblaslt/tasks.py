@@ -593,7 +593,6 @@ def build(
     cmake_opts = [
         f'"-DGPU_TARGETS={architecture}"',
         f"-DCMAKE_BUILD_TYPE={build_type}",
-        f"-DCMAKE_PREFIX_PATH={deps_prefix.as_posix()}",
         "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
         "-DMSGPACK_USE_BOOST=OFF",
     ]
@@ -709,6 +708,9 @@ def build(
         prefix_path = Path(cmake_prefix).as_posix()
     else:
         prefix_path = f"{rocm_s};{rocm_s}/hcc;{rocm_s}/hip"
+    # Dependencies built by --install-deps (googletest, lapack) live here, and must
+    # take precedence over system packages that may be too old.
+    prefix_path = f"{deps_prefix.as_posix()};{prefix_path}"
     module_path = f"{rocm_s}/hip/cmake"
 
     if relocatable:
