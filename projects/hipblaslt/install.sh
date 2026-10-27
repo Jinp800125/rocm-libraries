@@ -29,7 +29,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
-VENV_DIR="${BUILD_DIR}/venv"
+VENV_DIR="/opt/hipblaslt-venv/venv"
+# LOCAL ONLY (NFS): could be VENV_DIR="${HIPBLASLT_VENV_DIR:-${BUILD_DIR}/venv}"
+# and then export HIPBLASLT_VENV_DIR=/opt/hipblaslt-venv/venv on the host.
 
 # ---------------------------------------------------------------------------
 # Set up Python virtual environment (required on Ubuntu which blocks global pip)

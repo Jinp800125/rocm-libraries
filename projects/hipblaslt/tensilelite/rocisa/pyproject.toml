@@ -27,7 +27,10 @@ wheel.packages = []
 # instead of from scratch. This makes the rocisa rebuild that `invoke
 # build-client` triggers a fast no-op when nothing changed. {wheel_tag} keeps
 # per-interpreter/ABI build trees separate.
-build-dir = "build/{wheel_tag}"
+#build-dir = "build/{wheel_tag}"
+build-dir = "/tmp/rocisa-build/{wheel_tag}"
+# LOCAL ONLY (NFS): could keep the original build-dir and instead
+# export SKBUILD_BUILD_DIR='/tmp/rocisa-build/{wheel_tag}' (env overrides this file).
 
 # Compatibility default. Rebuild-on-import is deprecated because it makes an
 # ordinary import perform a native build; opt out now with
