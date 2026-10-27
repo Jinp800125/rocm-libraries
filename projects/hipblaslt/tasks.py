@@ -856,7 +856,11 @@ def _install_system_deps(
         lib_centos8 += ["rocm-llvm-devel", "zstd"]
         lib_sles += ["rocm-llvm-devel", "zstd"]
 
-    if not legacy_hipblas_direct:
+    # ROCm installs that don't come from the distro package manager (tarball,
+    # TheRock) already ship hipblas-common, and the -dev package may not exist.
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    has_hipblas_common = Path(rocm_path, "lib/cmake/hipblas-common").is_dir()
+    if not legacy_hipblas_direct and not has_hipblas_common:
         lib_ubuntu.append("hipblas-common-dev")
         lib_centos8.append("hipblas-common-devel")
 
