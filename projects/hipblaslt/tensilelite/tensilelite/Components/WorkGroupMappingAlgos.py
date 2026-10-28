@@ -411,7 +411,18 @@ def ClusterAIDRemap(writer, kernel):
     equivalent to s = (xcc - c) % 8 per cluster. l is then a bijection only if the hardware
     dispatch is strictly round-robin over XCCs within the launch.
 
-    Skipped at runtime unless the grid is a whole number of clusters and Nc % 8 == 0.
+    Except for -3, skipped at runtime unless the grid is a whole number of clusters and
+    Nc % 8 == 0.
+
+    ClusterAIDMapping == -3 keeps the 16 clusters that are dispatched together in one 4x4
+    block of the cluster grid instead of two 8-long strips. With xcc from MSG_RTN_GET_SE_AID_ID:
+        g = c // 16,  h = (c // 8) % 2
+        new cx = 4*(g // (Cy/4)) + 2*(xcc // 4) + h,   new cy = 4*(g % (Cy/4)) + xcc % 4
+    so each block's upper half (along M) goes to AID0 and its lower half to AID1, and both GL2s
+    read the block's B columns. Under strict round-robin, each half of a group (8 consecutive
+    ids) covers all 8 XCCs once, so the map is a bijection. h deliberately does not come from
+    the SE: the SE a cluster lands on is not fixed and can repeat within a group.
+    Skipped at runtime unless the grid is a whole number of clusters and Cx % 4 == Cy % 4 == 0.
     """
     module = Module("ClusterAIDRemap")
     start = kernel["ClusterAIDMapping"]
@@ -420,8 +431,12 @@ def ClusterAIDRemap(writer, kernel):
         return module
     numXCC, xccPerAID = 8, 4
     log2cs, log2ck = int(log2(cs)), int(log2(ck))
+    block = start == -3
 
-    module.addComment1("remap clusters onto AIDs: one contiguous half of the cluster grid per GL2")
+    if block:
+        module.addComment1("remap clusters onto AIDs: each group of 16 clusters fills one 4x4 block")
+    else:
+        module.addComment1("remap clusters onto AIDs: one contiguous half of the cluster grid per GL2")
     labelEnd    = Label(writer.labels.getNameInc("ClusterAIDRemapEnd"), "")
     labelSplitM = Label(writer.labels.getNameInc("ClusterAIDSplitM"), "")
     labelSplitN = Label(writer.labels.getNameInc("ClusterAIDSplitN"), "")
@@ -441,11 +456,17 @@ def ClusterAIDRemap(writer, kernel):
         module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
         module.add(SLShiftRightB32(dst=sgpr(sCx), shiftHex=hex(log2cs), src=sgpr("NumWorkGroups0"), comment="Cx"))
         module.add(SLShiftRightB32(dst=sgpr(sCy), shiftHex=hex(log2ck), src=sgpr("NumWorkGroups1"), comment="Cy"))
-        module.add(SMulI32(dst=sgpr(sHalf), src0=sgpr(sCx), src1=sgpr(sCy), comment="Nc"))
-        module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sHalf), src1=hex(numXCC - 1)))
-        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Nc % 8 == 0?"))
-        module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
-        module.add(SLShiftRightB32(dst=sgpr(sHalf), shiftHex=hex(1), src=sgpr(sHalf), comment="Nc / 2"))
+        if block:
+            module.add(SOrB32(dst=sgpr(sT), src0=sgpr(sCx), src1=sgpr(sCy)))
+            module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sT), src1=hex(3)))
+            module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cx % 4 == 0 and Cy % 4 == 0?"))
+            module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
+        else:
+            module.add(SMulI32(dst=sgpr(sHalf), src0=sgpr(sCx), src1=sgpr(sCy), comment="Nc"))
+            module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sHalf), src1=hex(numXCC - 1)))
+            module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Nc % 8 == 0?"))
+            module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
+            module.add(SLShiftRightB32(dst=sgpr(sHalf), shiftHex=hex(1), src=sgpr(sHalf), comment="Nc / 2"))
 
         module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2ck), src=sgpr("WorkGroup1"), comment="cy"))
         module.add(SMulI32(dst=sgpr(sL), src0=sgpr(sT), src1=sgpr(sCx)))
@@ -454,7 +475,7 @@ def ClusterAIDRemap(writer, kernel):
         module.add(SAndB32(dst=sgpr("WorkGroup0"), src0=sgpr("WorkGroup0"), src1=hex(cs - 1), comment="peer x"))
         module.add(SAndB32(dst=sgpr("WorkGroup1"), src0=sgpr("WorkGroup1"), src1=hex(ck - 1), comment="peer y"))
 
-        if start == -2:
+        if start in (-2, -3):
             module.add(SSendMsgRtnB32(dst=sgpr(sP), src=135, comment="MSG_RTN_GET_SE_AID_ID, [31:16] = XCC"))
             module.add(SWaitCnt(kmcnt=0, comment="wait SE_AID_ID"))
             module.add(SLShiftRightB32(dst=sgpr(sP), shiftHex=hex(16), src=sgpr(sP)))
@@ -462,35 +483,54 @@ def ClusterAIDRemap(writer, kernel):
         else:
             module.add(SAddU32(dst=sgpr(sP), src0=sgpr(sL), src1=start))
             module.add(SAndB32(dst=sgpr(sP), src0=sgpr(sP), src1=hex(numXCC - 1), comment="xcc = (c + start) % 8"))
-        module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2(xccPerAID)), src=sgpr(sP), comment="aid"))
-        module.add(SMulI32(dst=sgpr(sT), src0=sgpr(sT), src1=sgpr(sHalf), comment="aid * Nc/2"))
-        module.add(SLShiftRightB32(dst=sgpr(sL), shiftHex=hex(log2(numXCC)), src=sgpr(sL), comment="c // 8"))
-        module.add(SLShiftLeftB32(dst=sgpr(sL), shiftHex=hex(log2(xccPerAID)), src=sgpr(sL), comment="(c // 8) * 4"))
-        module.add(SAndB32(dst=sgpr(sP), src0=sgpr(sP), src1=hex(xccPerAID - 1), comment="xcc % 4"))
-        module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sP)))
-        module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sT), comment="l = aid*Nc/2 + (c//8)*4 + xcc%4"))
+        if block:
+            tmpVgpr = writer.vgprPool.checkOutAligned(4, 2, "ClusterAIDRemap_div")
+            tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
+            module.add(SLShiftRightB32(dst=sgpr(sHalf), shiftHex=hex(log2(numXCC)), src=sgpr(sL), comment="c // 8"))
+            module.add(SAndB32(dst=sgpr(sHalf), src0=sgpr(sHalf), src1=1, comment="h = (c // 8) % 2"))
+            module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sP), src1=hex(xccPerAID - 1), comment="xcc % 4"))
+            module.add(SLShiftRightB32(dst=sgpr(sP), shiftHex=hex(log2(xccPerAID)), src=sgpr(sP), comment="aid"))
+            module.add(SLShiftLeftB32(dst=sgpr(sP), shiftHex=hex(1), src=sgpr(sP)))
+            module.add(SAddU32(dst=sgpr(sP), src0=sgpr(sP), src1=sgpr(sHalf), comment="row in block = 2*aid + h"))
+            module.add(SLShiftRightB32(dst=sgpr(sL), shiftHex=hex(4), src=sgpr(sL), comment="g = c // 16"))
+            module.add(SLShiftRightB32(dst=sgpr(sCy), shiftHex=hex(2), src=sgpr(sCy), comment="blocks along N = Cy / 4"))
+            module.add(scalarUInt24DivideAndRemainder(qReg=sCx, dReg=sL, divReg=sCy, rReg=sHalf, tmpVgprRes=tmpVgprRes,
+                                                      wavewidth=kernel["WavefrontSize"], doRemainder=True))
+            writer.vgprPool.checkIn(tmpVgpr)
+            module.add(SLShiftLeftB32(dst=sgpr(sCx), shiftHex=hex(2), src=sgpr(sCx)))
+            module.add(SAddU32(dst=sgpr(sP), src0=sgpr(sP), src1=sgpr(sCx), comment="new cx = 4*(g / (Cy/4)) + row in block"))
+            module.add(SLShiftLeftB32(dst=sgpr(sHalf), shiftHex=hex(2), src=sgpr(sHalf)))
+            module.add(SAddU32(dst=sgpr(sT), src0=sgpr(sT), src1=sgpr(sHalf), comment="new cy = 4*(g % (Cy/4)) + xcc % 4"))
+        else:
+            module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2(xccPerAID)), src=sgpr(sP), comment="aid"))
+            module.add(SMulI32(dst=sgpr(sT), src0=sgpr(sT), src1=sgpr(sHalf), comment="aid * Nc/2"))
+            module.add(SLShiftRightB32(dst=sgpr(sL), shiftHex=hex(log2(numXCC)), src=sgpr(sL), comment="c // 8"))
+            module.add(SLShiftLeftB32(dst=sgpr(sL), shiftHex=hex(log2(xccPerAID)), src=sgpr(sL), comment="(c // 8) * 4"))
+            module.add(SAndB32(dst=sgpr(sP), src0=sgpr(sP), src1=hex(xccPerAID - 1), comment="xcc % 4"))
+            module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sP)))
+            module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sT), comment="l = aid*Nc/2 + (c//8)*4 + xcc%4"))
 
-        module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCy), src1=1))
-        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cy even: N split keeps halves whole"))
-        module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
-        module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCx), src1=1))
-        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cx even: M split keeps halves whole"))
-        module.add(SCBranchSCC0(labelName=labelSplitN.getLabelName()))
-        module.add(SMulI32(dst=sgpr(sT), src0=sgpr("NumWorkGroups0"), src1=kernel["MacroTile0"], comment="M (A rows)"))
-        module.add(SMulI32(dst=sgpr(sP), src0=sgpr("NumWorkGroups1"), src1=kernel["MacroTile1"], comment="N (B cols)"))
-        module.add(SCmpLeU32(src0=sgpr(sT), src1=sgpr(sP), comment="duplicate the smaller operand"))
-        module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
+            module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCy), src1=1))
+            module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cy even: N split keeps halves whole"))
+            module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
+            module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCx), src1=1))
+            module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cx even: M split keeps halves whole"))
+            module.add(SCBranchSCC0(labelName=labelSplitN.getLabelName()))
+            module.add(SMulI32(dst=sgpr(sT), src0=sgpr("NumWorkGroups0"), src1=kernel["MacroTile0"], comment="M (A rows)"))
+            module.add(SMulI32(dst=sgpr(sP), src0=sgpr("NumWorkGroups1"), src1=kernel["MacroTile1"], comment="N (B cols)"))
+            module.add(SCmpLeU32(src0=sgpr(sT), src1=sgpr(sP), comment="duplicate the smaller operand"))
+            module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
 
-        tmpVgpr = writer.vgprPool.checkOutAligned(4, 2, "ClusterAIDRemap_div")
-        tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
-        module.add(labelSplitN)
-        module.add(scalarUInt24DivideAndRemainder(qReg=sT, dReg=sL, divReg=sCx, rReg=sP, tmpVgprRes=tmpVgprRes,
-                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True))
-        module.add(SBranch(labelName=labelApply.getLabelName()))
-        module.add(labelSplitM)
-        module.add(scalarUInt24DivideAndRemainder(qReg=sP, dReg=sL, divReg=sCy, rReg=sT, tmpVgprRes=tmpVgprRes,
-                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True))
-        writer.vgprPool.checkIn(tmpVgpr)
+            tmpVgpr = writer.vgprPool.checkOutAligned(4, 2, "ClusterAIDRemap_div")
+            tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
+            module.add(labelSplitN)
+            module.add(scalarUInt24DivideAndRemainder(qReg=sT, dReg=sL, divReg=sCx, rReg=sP, tmpVgprRes=tmpVgprRes,
+                                                      wavewidth=kernel["WavefrontSize"], doRemainder=True))
+            module.add(SBranch(labelName=labelApply.getLabelName()))
+            module.add(labelSplitM)
+            module.add(scalarUInt24DivideAndRemainder(qReg=sP, dReg=sL, divReg=sCy, rReg=sT, tmpVgprRes=tmpVgprRes,
+                                                      wavewidth=kernel["WavefrontSize"], doRemainder=True))
+            writer.vgprPool.checkIn(tmpVgpr)
 
         module.add(labelApply)
         module.add(SLShiftLeftB32(dst=sgpr(sP), shiftHex=hex(log2cs), src=sgpr(sP), comment="new cx * Cs"))

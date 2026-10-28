@@ -1285,10 +1285,12 @@ validParameters = { # we need to make sure this matches develop
     "ClusterDim": validClusterDimensions,
     # Remap clusters onto the two AIDs (4 XCCs and one GL2 each) so that each GL2 reads
     # one operand once and only the other operand is duplicated across GL2s.
+    # -3: Like -2, but each group of 16 consecutive clusters fills one 4x4 block of the cluster
+    #     grid (upper half AID0, lower half AID1); needs Cx and Cy to be multiples of 4
     # -2: Read each cluster's XCC from MSG_RTN_GET_SE_AID_ID (requires strict round-robin dispatch)
     # -1: Disabled
     # 0-7: XCC that the hardware round-robin dispatches cluster 0 to
-    "ClusterAIDMapping": list(range(-2, 0)),
+    "ClusterAIDMapping": list(range(-3, 0)),
     # Enable PLR 0.5 to save vgprs
     # 0: Disabled
     # 1: Use PLR 0.5 for A
