@@ -1308,6 +1308,10 @@ validParameters = { # we need to make sure this matches develop
     # -1: Disabled
     # 0-7: XCC that the hardware round-robin dispatches cluster 0 to
     "ClusterAIDMapping": list(range(-2, 0)),
+    # Order clusters inside each AID half in bands of this many clusters along the half's
+    # split dimension (like WorkGroupMapping), so consecutive clusters cover a block.
+    # 1: row-major (no extra code). Requires ClusterAIDMapping != -1.
+    "ClusterAIDWGM": [1, 2, 4, 8, 16, 32],
     # Enable PLR 0.5 to save vgprs
     # 0: Disabled
     # 1: Use PLR 0.5 for A

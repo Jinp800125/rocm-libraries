@@ -315,6 +315,11 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     else:
       requiredParametersTemp.discard("ClusterAIDMapping")
 
+    if state.get("ClusterAIDWGM", 1) != 1:
+      requiredParametersTemp.add("ClusterAIDWGM")
+    else:
+      requiredParametersTemp.discard("ClusterAIDWGM")
+
     for key in sorted(requiredParametersTemp):
       if key not in state or key == "CustomKernel":
         continue

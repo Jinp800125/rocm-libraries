@@ -182,4 +182,5 @@ def getRequiredParametersMin() -> set:
         'UseSubtileImpl',
         'ClusterDim',
         'ClusterAIDMapping',
+        'ClusterAIDWGM',
     })

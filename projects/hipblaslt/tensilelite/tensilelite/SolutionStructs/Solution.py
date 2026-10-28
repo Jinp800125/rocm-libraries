@@ -7390,6 +7390,10 @@ class Solution(collections.abc.Mapping):
           state, problemType, isa, isaInfoMap, packedC0, packedC1)
       state["_RAPNumResidentKTiles"] = max(state["PrefetchGlobalRead"] + 1, kMax or 0)
 
+    if state.get("ClusterAIDWGM", 1) != 1 and (state.get("ClusterAIDMapping", -1) == -1 or not clusterEnabled(state["ClusterDim"])):
+      reject(state, printRejectionReason, "ClusterAIDWGM needs ClusterAIDMapping != -1 and a non-[1,1] ClusterDim")
+      return
+
     if state["LDSSegmentBRotate"]:
       _bRotReason = segBRotateReason(state, isPersistent(state))
       if _bRotReason is not None:

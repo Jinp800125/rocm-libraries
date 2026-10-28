@@ -685,6 +685,10 @@ defaultBenchmarkCommonParameters = [
     # half of the cluster grid. -1 disables; 0-7 is the XCC that receives cluster 0;
     # -2 reads each cluster's XCC from the hardware.
     {"ClusterAIDMapping": [-1]},
+    # ClusterAIDWGM — WGM-style band height (in clusters) for the order of clusters inside
+    # each AID half, so the clusters in flight on one GL2 form a block instead of a strip.
+    # 1 keeps row-major order.
+    {"ClusterAIDWGM": [1]},
     {"HalfPLR": [0]},
     {"TDMIterateMode": [0]}
 ]

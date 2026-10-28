@@ -411,6 +411,12 @@ def ClusterAIDRemap(writer, kernel):
     equivalent to s = (xcc - c) % 8 per cluster. l is then a bijection only if the hardware
     dispatch is strictly round-robin over XCCs within the launch.
 
+    ClusterAIDWGM = H > 1 reorders l inside each half, which has F clusters along the
+    undivided dimension and S = (Nc/2)/F along the split one: with j = l - aid*Nc/2,
+    q = j // F, r = j % F, band b = q // H of height h = min(H, S - b*H):
+        slow = aid*S + b*H + (q%H*F + r) % h,  fast = (q%H*F + r) // h
+    so any H consecutive l cover an (W/H) x H block instead of a 1 x W strip.
+
     Skipped at runtime unless the grid is a whole number of clusters and Nc % 8 == 0.
     """
     module = Module("ClusterAIDRemap")
@@ -420,6 +426,7 @@ def ClusterAIDRemap(writer, kernel):
         return module
     numXCC, xccPerAID = 8, 4
     log2cs, log2ck = int(log2(cs)), int(log2(ck))
+    bandH = kernel.get("ClusterAIDWGM", 1)
 
     module.addComment1("remap clusters onto AIDs: one contiguous half of the cluster grid per GL2")
     labelEnd    = Label(writer.labels.getNameInc("ClusterAIDRemapEnd"), "")
@@ -427,8 +434,9 @@ def ClusterAIDRemap(writer, kernel):
     labelSplitN = Label(writer.labels.getNameInc("ClusterAIDSplitN"), "")
     labelApply  = Label(writer.labels.getNameInc("ClusterAIDApply"), "")
 
-    with writer.allocTmpSgpr(6, tag="ClusterAIDRemap") as tmp:
+    with writer.allocTmpSgpr(6 if bandH == 1 else 10, tag="ClusterAIDRemap") as tmp:
         sCx, sCy, sHalf, sL, sT, sP = range(tmp.idx, tmp.idx + 6)
+        sS, sJ, sQ, sR = range(tmp.idx + 6, tmp.idx + 10)
 
         if kernel["GlobalSplitU"] != 0:
             module.add(SAndB32(dst=sgpr(sT), src0=sgpr("GSU"), src1=writer.gsuMaskHex(kernel), comment="Restore GSU"))
@@ -483,13 +491,40 @@ def ClusterAIDRemap(writer, kernel):
 
         tmpVgpr = writer.vgprPool.checkOutAligned(4, 2, "ClusterAIDRemap_div")
         tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
+
+        def divide(q, d, div, r):
+            return scalarUInt24DivideAndRemainder(qReg=q, dReg=d, divReg=div, rReg=r, tmpVgprRes=tmpVgprRes,
+                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True)
+
+        def bandedOrder(sF, sSplit, sSlow, sFast):
+            module.add(SLShiftRightB32(dst=sgpr(sS), shiftHex=hex(1), src=sgpr(sSplit), comment="S = clusters per half along split dim"))
+            module.add(SCmpGeU32(src0=sgpr(sL), src1=sgpr(sHalf), comment="aid 1?"))
+            module.add(SCSelectB32(dst=sgpr(sJ), src0=sgpr(sHalf), src1=0))
+            module.add(SCSelectB32(dst=sgpr(sHalf), src0=sgpr(sS), src1=0, comment="aid * S"))
+            module.add(SSubU32(dst=sgpr(sJ), src0=sgpr(sL), src1=sgpr(sJ), comment="j = l - aid*Nc/2"))
+            module.add(divide(sQ, sJ, sF, sR))
+            module.add(SLShiftRightB32(dst=sgpr(sL), shiftHex=hex(log2(bandH)), src=sgpr(sQ), comment="band b = q // H"))
+            module.add(SAndB32(dst=sgpr(sQ), src0=sgpr(sQ), src1=hex(bandH - 1)))
+            module.add(SMulI32(dst=sgpr(sQ), src0=sgpr(sQ), src1=sgpr(sF)))
+            module.add(SAddU32(dst=sgpr(sJ), src0=sgpr(sQ), src1=sgpr(sR), comment="index in band = q%H*F + r"))
+            module.add(SLShiftLeftB32(dst=sgpr(sQ), shiftHex=hex(log2(bandH)), src=sgpr(sL), comment="b * H"))
+            module.add(SSubU32(dst=sgpr(sR), src0=sgpr(sS), src1=sgpr(sQ)))
+            module.add(SMinU32(dst=sgpr(sR), src0=sgpr(sR), src1=bandH, comment="h = min(H, S - b*H)"))
+            module.add(divide(sFast, sJ, sR, sSlow))
+            module.add(SAddU32(dst=sgpr(sSlow), src0=sgpr(sSlow), src1=sgpr(sQ)))
+            module.add(SAddU32(dst=sgpr(sSlow), src0=sgpr(sSlow), src1=sgpr(sHalf), comment="slow = aid*S + b*H + idx % h"))
+
         module.add(labelSplitN)
-        module.add(scalarUInt24DivideAndRemainder(qReg=sT, dReg=sL, divReg=sCx, rReg=sP, tmpVgprRes=tmpVgprRes,
-                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True))
+        if bandH == 1:
+            module.add(divide(sT, sL, sCx, sP))
+        else:
+            bandedOrder(sF=sCx, sSplit=sCy, sSlow=sT, sFast=sP)
         module.add(SBranch(labelName=labelApply.getLabelName()))
         module.add(labelSplitM)
-        module.add(scalarUInt24DivideAndRemainder(qReg=sP, dReg=sL, divReg=sCy, rReg=sT, tmpVgprRes=tmpVgprRes,
-                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True))
+        if bandH == 1:
+            module.add(divide(sP, sL, sCy, sT))
+        else:
+            bandedOrder(sF=sCy, sSplit=sCx, sSlow=sP, sFast=sT)
         writer.vgprPool.checkIn(tmpVgpr)
 
         module.add(labelApply)
