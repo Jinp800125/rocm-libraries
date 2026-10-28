@@ -13,8 +13,9 @@ kernel must:
      cluster ('reduce multicast mask to real WGs in cluster') so the broadcast
      does not wait for the multicast timeout on the missing padded WGs.
 
-The padding config also forks ClusterAIDMapping over -1, -2 and -3, so the
-cluster-to-AID remap is emitted for the -2 (halves) and -3 (4x4 blocks) kernels.
+The padding config also forks ClusterAIDMapping over -1, -2, -3 and -4, so the
+cluster-to-AID remap is emitted for the -2 (halves), -3 (4x4 blocks) and -4 (halves in
+4-wide bands) kernels.
 """
 
 import os
@@ -89,16 +90,19 @@ def test_cluster_padding_gfx1250_emits_early_exit_and_reduced_mask():
             f"Kernel {base!r}: multicast mask not reduced for boundary cluster"
         )
 
-    # ClusterAIDMapping forks -1 / -2 / -3: only -2 and -3 emit the AID remap, and
-    # all three kernels are named apart.
+    # ClusterAIDMapping forks -1 / -2 / -3 / -4: only -2, -3 and -4 emit the AID remap,
+    # and all four kernels are named apart.
     remapped = [(b, s) for (b, s, _e) in results if "remap clusters onto AIDs" in s]
-    assert len(results) == 3 and len(remapped) == 2, (
-        f"Expected 3 kernels with 2 remapped, got {len(results)} with {len(remapped)} remapped"
+    assert len(results) == 4 and len(remapped) == 3, (
+        f"Expected 4 kernels with 3 remapped, got {len(results)} with {len(remapped)} remapped"
     )
-    assert len({b for (b, _s, _e) in results}) == 3, "ClusterAIDMapping forks share a kernel name"
+    assert len({b for (b, _s, _e) in results}) == 4, "ClusterAIDMapping forks share a kernel name"
     halves = [(b, s) for (b, s) in remapped if "one contiguous half of the cluster grid" in s]
     blocks = [(b, s) for (b, s) in remapped if "each group of 16 clusters fills one 4x4 block" in s]
-    assert len(halves) == 1 and len(blocks) == 1, "Expected one -2 and one -3 remapped kernel"
+    bands = [(b, s) for (b, s) in remapped if "walked in 4-wide bands" in s]
+    assert len(halves) == 1 and len(blocks) == 1 and len(bands) == 1, (
+        "Expected one -2, one -3 and one -4 remapped kernel"
+    )
     base, src = halves[0]
     for marker in ("MSG_RTN_GET_SE_AID_ID", "grid is whole clusters?", "Nc % 8 == 0?",
                    "ClusterAIDSplitN", "ClusterAIDSplitM"):
@@ -109,6 +113,13 @@ def test_cluster_padding_gfx1250_emits_early_exit_and_reduced_mask():
         assert marker in src, f"Kernel {base!r}: 4x4-block AID remap missing {marker!r}"
     for marker in ("ClusterAIDSplitN", "Nc % 8 == 0?"):
         assert marker not in src, f"Kernel {base!r}: 4x4-block AID remap emits {marker!r}"
+    base, src = bands[0]
+    for marker in ("MSG_RTN_GET_SE_AID_ID", "grid is whole clusters?", "Cx % 2 == 0 and Cy % 4 == 0?",
+                   "Cy % 2 == 0 and Cx % 4 == 0?", "duplicate the smaller operand", "q = c // 8",
+                   "new cx = 4*(q / H) + xcc % 4", "new cx = aid*H + q % H"):
+        assert marker in src, f"Kernel {base!r}: banded AID remap missing {marker!r}"
+    for marker in ("Nc % 8 == 0?", "l = aid*Nc/2"):
+        assert marker not in src, f"Kernel {base!r}: banded AID remap emits {marker!r}"
 
 
 def test_cluster_padding_npot_mt1_keeps_wg_x_for_mask_shift():

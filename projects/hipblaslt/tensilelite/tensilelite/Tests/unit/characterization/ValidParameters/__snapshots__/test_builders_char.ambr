@@ -1688,11 +1688,11 @@
     }),
     'ClusterAIDMapping': dict({
       'head': list([
+        -4,
         -3,
         -2,
-        -1,
       ]),
-      'len': 3,
+      'len': 4,
       'type': 'list',
     }),
     'ClusterDim': dict({

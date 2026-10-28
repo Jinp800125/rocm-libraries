@@ -666,7 +666,8 @@ defaultBenchmarkCommonParameters = [
     # ClusterAIDMapping — permute cluster ids so each AID (and its GL2) gets a contiguous
     # half of the cluster grid. -1 disables; 0-7 is the XCC that receives cluster 0;
     # -2 reads each cluster's XCC from the hardware; -3 also reads it and packs each group
-    # of 16 clusters into a 4x4 block instead.
+    # of 16 clusters into a 4x4 block instead; -4 keeps the halves of -2 but walks each half
+    # in bands 4 clusters wide.
     {"ClusterAIDMapping": [-1]},
     {"HalfPLR": [0]},
     {"TDMIterateMode": [0]}
