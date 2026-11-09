@@ -334,6 +334,8 @@ def DefaultWGM(writer, kernel, sgprWGM, wg0="WorkGroup0", wg1="WorkGroup1"):
     if clusterEnabled(kernel["ClusterDim"]):
       # tmpWGM holds the decoded, signed WGM; ClusterAIDRemap uses it as the band height in
       # clusters, then the WG-unit WGM below is skipped so the order is not applied twice.
+      # tmpWGM 已經解碼成帶正負號的 WGM，傳給 ClusterAIDRemap 當 cluster 單位的 band 高度；
+      # remap 完直接跳過下面以 WG 為單位的 WGM 計算，避免排序被做兩次。
       module.add(ClusterAIDRemap(writer, kernel, tmpWGM))
       module.add(SBranch(wgmLabel.getLabelName()))
 
@@ -427,6 +429,24 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
     h = min(H, Lp - b*H): p = b*H + r % h, q = r // h. Any W consecutive l then cover a
     (W/H) x H block instead of a 1 x W strip.
 
+    中文說明（runtime WorkGroupMapping）：
+      上面的 l 決定了「哪個 cluster 屬於哪個 AID」，以及它在那一半裡的先後順序（l 越小越早派發）。
+      如果 l -> (cx, cy) 照 row-major 排，同一時間在跑的 W 個 cluster 會排成 1 x W 的細長條，
+      一份 GL2 要同時放進很多 A panel（或 B panel）。
+      開了 cluster 之後，DefaultWGM 原本以 WG 為單位的 WGM 計算會整段跳過，所以這裡改用 runtime 的
+      WGM（sgprWGM，DefaultWGM 已經解碼並做過 sign-extend），在每一半裡做 WGM 式的 band 排序：
+        - 單位是 cluster：|WGM| = H 代表每條 band 高 H 個 cluster（ClusterDim 4x4 時 WGM 2 = 8 列 WG）
+        - |WGM| <= 1：維持 row-major
+        - 正負號沿用 DefaultWGM 的慣例：WGM > 0 沿 cy 切 band，WGM < 0 沿 cx 切 band
+        - band 在 band 內先走短邊（高度 h），再往另一維推進
+        - 最後一條 band 若不足 H，用實際剩下的高度 h = min(H, Lp - b*H)，所以不要求能整除
+        - H 是 runtime 值、不限 2 的冪次，所以用 scalarUInt24DivideAndRemainder 做真的除法
+        - 所有 WGM 值共用同一個 kernel，換值不用重新編譯（例如 GemmTuning::setWgm）
+      band 只在各自那一半裡切，不會跨過兩個 AID 的邊界，因此每個 AID 仍然只碰自己那一半；
+      對 [0, Nc/2) 仍是一一對應，每塊 tile 剛好被算一次。
+      符號：Lp = 被切成 band 的那一維在半內的長度，Lq = 另一維的長度，
+            b = 第幾條 band，h = 這條 band 實際的高度，p / q = 新座標（p 在 Lp 那一維，q 在 Lq 那一維）。
+
     Skipped at runtime unless the grid is a whole number of clusters and Nc % 8 == 0.
     """
     module = Module("ClusterAIDRemap")
@@ -444,6 +464,7 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
     labelApply  = Label(writer.labels.getNameInc("ClusterAIDApply"), "")
 
     # BandN / BandM set up F and S for split N / split M, then both fall into Band
+    # runtime WGM 路徑用的 label：BandN / BandM 分別替 split N / split M 準備 F、S，再一起跳到 Band 做排序
     labelBand   = Label(writer.labels.getNameInc("ClusterAIDBand"), "")
     labelBandN  = Label(writer.labels.getNameInc("ClusterAIDBandN"), "")
     labelBandM  = Label(writer.labels.getNameInc("ClusterAIDBandM"), "")
@@ -452,11 +473,16 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
     #   sS = split direction (0 = split N, 1 = split M), sJ = index j inside the half,
     #   sQ = H = |WGM|, sR = divisor / band height h.
     # WGM is only known at runtime, so all 10 are always allocated.
+    # 暫存 sgpr 共 10 個。前 6 個是原本 remap 用的；band 排序多用 4 個：
+    #   sS = split 方向旗標（0 = split N，1 = split M），sJ = 半內序號 j，
+    #   sQ = H = |WGM|，sR = 除數 / band 高度 h 等暫存。
+    # WGM 要到 runtime 才知道要不要分塊，所以一律先留好 10 個。
     with writer.allocTmpSgpr(10, tag="ClusterAIDRemap") as tmp:
         sCx, sCy, sHalf, sL, sT, sP = range(tmp.idx, tmp.idx + 6)
         sS, sJ, sQ, sR = range(tmp.idx + 6, tmp.idx + 10)
 
         # ---- preconditions: otherwise skip the remap and keep the original cluster order ----
+        # 前置檢查：條件不符就整段跳過，維持原本的 cluster 排列
         if kernel["GlobalSplitU"] != 0:
             module.add(SAndB32(dst=sgpr(sT), src0=sgpr("GSU"), src1=writer.gsuMaskHex(kernel), comment="Restore GSU"))
             module.add(SCmpEQU32(src0=sgpr(sT), src1=1, comment="GSU == 1?"))
@@ -475,6 +501,7 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(SLShiftRightB32(dst=sgpr(sHalf), shiftHex=hex(1), src=sgpr(sHalf), comment="Nc / 2"))
 
         # ---- dispatch id c of this cluster; keep only the peer position in WorkGroup0/1 ----
+        # 算出這個 cluster 的派發序號 c，並把 WorkGroup0/1 留下 cluster 內的 peer 位置
         module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2ck), src=sgpr("WorkGroup1"), comment="cy"))
         module.add(SMulI32(dst=sgpr(sL), src0=sgpr(sT), src1=sgpr(sCx)))
         module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2cs), src=sgpr("WorkGroup0"), comment="cx"))
@@ -483,12 +510,14 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(SAndB32(dst=sgpr("WorkGroup1"), src0=sgpr("WorkGroup1"), src1=hex(ck - 1), comment="peer y"))
 
         # ---- XCC this cluster runs on ----
+        # 求出這個 cluster 所在的 XCC
         module.add(SSendMsgRtnB32(dst=sgpr(sP), src=135, comment="MSG_RTN_GET_SE_AID_ID, [31:16] = XCC"))
         module.add(SWaitCnt(kmcnt=0, comment="wait SE_AID_ID"))
         module.add(SLShiftRightB32(dst=sgpr(sP), shiftHex=hex(16), src=sgpr(sP)))
         module.add(SAndB32(dst=sgpr(sP), src0=sgpr(sP), src1=hex(numXCC - 1), comment="xcc from hardware"))
 
         # ---- l = aid*Nc/2 + (c//8)*4 + xcc%4: [0, Nc/2) belongs to AID0, [Nc/2, Nc) to AID1 ----
+        # 算出 l = aid*Nc/2 + (c//8)*4 + xcc%4：l 在 [0, Nc/2) 屬 AID0，[Nc/2, Nc) 屬 AID1
         module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2(xccPerAID)), src=sgpr(sP), comment="aid"))
         module.add(SMulI32(dst=sgpr(sT), src0=sgpr(sT), src1=sgpr(sHalf), comment="aid * Nc/2"))
         module.add(SLShiftRightB32(dst=sgpr(sL), shiftHex=hex(log2(numXCC)), src=sgpr(sL), comment="c // 8"))
@@ -498,6 +527,7 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sT), comment="l = aid*Nc/2 + (c//8)*4 + xcc%4"))
 
         # ---- choose the split dim (split N along cy, split M along cx) ----
+        # 決定兩半要沿哪一維切（split N 沿 cy，split M 沿 cx）
         module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCy), src1=1))
         module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cy even: N split keeps halves whole"))
         module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
@@ -515,6 +545,9 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         # divide(q, d, div, r): unsigned sgpr division, q = d // div, r = d % div.
         # Uses the 4 tmp vgprs above and is exact only for 24-bit values (cluster counts are far
         # below 2^24); it may clobber SCC, so do not reuse a compare across it.
+        # divide(q, d, div, r)：產生一段 sgpr 無號整數除法，q = d // div、r = d % div。
+        # 借用上面的 4 個 tmp vgpr，只保證 24-bit 以內的值正確（cluster 數遠小於 2^24）；
+        # 中間可能會改 SCC，呼叫後不要沿用之前的比較結果。
         def divide(q, d, div, r):
             return scalarUInt24DivideAndRemainder(qReg=q, dReg=d, divReg=div, rReg=r, tmpVgprRes=tmpVgprRes,
                                                   wavewidth=kernel["WavefrontSize"], doRemainder=True)
@@ -522,6 +555,8 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         def skipToBandIfWGM(label):
             # Branch to the band path only if H = |WGM| > 1; otherwise fall through to row-major.
             # sQ carries H into wgmBandedOrder.
+            # runtime 判斷要不要分塊：H = |WGM| > 1 才跳去 band 路徑，否則照原本 row-major 繼續往下走。
+            # sQ 會一路帶著 H 進到 wgmBandedOrder。
             module.add(SAbsI32(dst=sgpr(sQ), src=sgpr(sgprWGM), comment="H = |WGM|"))
             module.add(SCmpGtU32(src0=sgpr(sQ), src1=1, comment="WGM bands inside the half?"))
             module.add(SCBranchSCC1(labelName=label.getLabelName()))
@@ -540,14 +575,29 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
             #   7. map (split dim, other dim) to (cx, cy) by sS: cy is the split dim for split N, cx for split M
             # Branch-free: s_cselect does not touch SCC, so one compare can drive two selects.
             # sCx / sCy hold F / S on entry; the original Cx / Cy are dead, labelApply reads only sP / sT.
+            # runtime WGM 的 band 排序，split N / split M 共用同一段程式：
+            #   1. 看 l 落在哪一半，算出半內序號 j 與 aid*S（之後要加回被切那一維的座標）
+            #   2. 決定 band 沿哪一維切：sT = (WGM < 0) xor (split M)
+            #        sT == 0：band 沿 split 的那一維（Lp = S，Lq = F）
+            #        sT == 1：band 沿另一維（Lp = F，Lq = S）
+            #      例：split N 時 split 維是 cy，WGM > 0 也是沿 cy，所以 sT = 0
+            #   3. 一條完整的 band 有 H*Lq 個 cluster：b = j // (H*Lq)，r = j % (H*Lq)
+            #   4. h = min(H, Lp - b*H)，最後一條 band 不滿 H 時用剩下的高度
+            #   5. band 內先走 Lp 方向：p = b*H + r % h，q = r // h
+            #   6. 依 sT 把 (p, q) 換回 (split 維座標, 另一維座標)，split 維座標再加上 aid*S
+            #   7. 依 sS 把 (split 維, 另一維) 換回 (cx, cy)：split N 時 cy 是 split 維，split M 時 cx 是
+            # 只用 s_cselect 選暫存器，沒有分支；s_cselect 不會改 SCC，所以同一個比較可以連續選兩次。
+            # sCx / sCy 進來時已經改放 F / S，原本的 Cx / Cy 之後用不到；labelApply 只看 sP / sT。
 
             # ---- step 1: which half l is in: j and aid*S ----
+            # 步驟 1：l 屬於哪一半，算出 j 與 aid*S
             module.add(SCmpGeU32(src0=sgpr(sL), src1=sgpr(sHalf), comment="aid 1?"))
             module.add(SCSelectB32(dst=sgpr(sJ), src0=sgpr(sHalf), src1=0))
             module.add(SCSelectB32(dst=sgpr(sHalf), src0=sgpr(sCy), src1=0, comment="aid * S"))
             module.add(SSubU32(dst=sgpr(sJ), src0=sgpr(sL), src1=sgpr(sJ), comment="j = l - aid*Nc/2"))
 
             # ---- step 2: pick the banded dim: Lp / Lq ----
+            # 步驟 2：決定 band 沿哪一維切，選出 Lp / Lq
             module.add(SCmpGtI32(src0=sgpr(sgprWGM), src1=0, comment="WGM > 0: bands along cy"))
             module.add(SCSelectB32(dst=sgpr(sT), src0=0, src1=1))
             module.add(SXorB32(dst=sgpr(sT), src0=sgpr(sT), src1=sgpr(sS), comment="0: banded dim is the split dim"))
@@ -556,25 +606,30 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
             module.add(SCSelectB32(dst=sgpr(sL), src0=sgpr(sCx), src1=sgpr(sCy), comment="Lq"))
 
             # ---- step 3: band b of j and index r inside the band ----
+            # 步驟 3：j 落在第幾條 band，以及在 band 內的序號
             module.add(SMulI32(dst=sgpr(sR), src0=sgpr(sQ), src1=sgpr(sL), comment="H * Lq"))
             module.add(divide(sCx, sJ, sR, sCy))
             module.add(SMulI32(dst=sgpr(sCx), src0=sgpr(sCx), src1=sgpr(sQ), comment="b * H"))
 
             # ---- step 4: actual height h of this band ----
+            # 步驟 4：這條 band 實際的高度 h
             module.add(SSubU32(dst=sgpr(sR), src0=sgpr(sP), src1=sgpr(sCx)))
             module.add(SMinU32(dst=sgpr(sR), src0=sgpr(sR), src1=sgpr(sQ), comment="h = min(H, Lp - b*H)"))
 
             # ---- step 5: inside the band walk Lp (height h) first, then Lq ----
+            # 步驟 5：band 內先走 Lp 方向（短邊 h），再往 Lq 方向推進
             module.add(divide(sL, sCy, sR, sJ))
             module.add(SAddU32(dst=sgpr(sJ), src0=sgpr(sJ), src1=sgpr(sCx), comment="p = b*H + r % h"))
 
             # ---- step 6: (p, q) to (split-dim coord, other coord) ----
+            # 步驟 6：(p, q) 換回 (split 維座標, 另一維座標)
             module.add(SCmpEQU32(src0=sgpr(sT), src1=0))
             module.add(SCSelectB32(dst=sgpr(sP), src0=sgpr(sJ), src1=sgpr(sL), comment="split-dim coord in half"))
             module.add(SCSelectB32(dst=sgpr(sR), src0=sgpr(sL), src1=sgpr(sJ), comment="other coord"))
             module.add(SAddU32(dst=sgpr(sP), src0=sgpr(sP), src1=sgpr(sHalf), comment="+ aid * S"))
 
             # ---- step 7: (split dim, other dim) to (cx, cy) ----
+            # 步驟 7：(split 維, 另一維) 換回 (cx, cy)
             module.add(SCmpEQU32(src0=sgpr(sS), src1=0, comment="split N?"))
             module.add(SCSelectB32(dst=sgpr(sT), src0=sgpr(sP), src1=sgpr(sR), comment="cy"))
             module.add(SCSelectB32(dst=sgpr(sP), src0=sgpr(sR), src1=sgpr(sP), comment="cx"))
@@ -582,6 +637,9 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         # split N halves along cy with F = Cx; split M halves along cx with F = Cy.
         # Both leave sP = new cx, sT = new cy for labelApply. Each branch checks the runtime WGM
         # first: band order goes to BandN / BandM, otherwise row-major.
+        # split N：兩半沿 cy 切開，F = Cx；split M：兩半沿 cx 切開，F = Cy。
+        # 輸出統一放在 sP = 新的 cx、sT = 新的 cy，交給 labelApply 換回 WorkGroup0/1。
+        # 每個分支先問 runtime WGM：要分塊就跳到 BandN / BandM，否則走原本的 row-major。
         module.add(labelSplitN)
         skipToBandIfWGM(labelBandN)
         module.add(divide(sT, sL, sCx, sP))
@@ -593,6 +651,8 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
 
         # wgmBandedOrder inputs: sCx = F (undivided dim), sCy = S (half length along the split dim),
         # sS = split direction.
+        # 準備 wgmBandedOrder 的輸入：sCx = F（沒被切的那一維），sCy = S（每半沿 split 維的長度），
+        # sS = split 方向。
         module.add(labelBandN)
         module.add(SLShiftRightB32(dst=sgpr(sCy), shiftHex=hex(1), src=sgpr(sCy), comment="S = Cy / 2"))
         module.add(SMovB32(dst=sgpr(sS), src=0, comment="split N"))
@@ -608,6 +668,7 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
 
         module.add(labelApply)
         # ---- new (cx, cy) back to WorkGroup0/1, peer position unchanged ----
+        # 新的 (cx, cy) 換回 WorkGroup0/1，cluster 內的 peer 位置不變
         module.add(SLShiftLeftB32(dst=sgpr(sP), shiftHex=hex(log2cs), src=sgpr(sP), comment="new cx * Cs"))
         module.add(SAddU32(dst=sgpr("WorkGroup0"), src0=sgpr("WorkGroup0"), src1=sgpr(sP), comment="WorkGroup0 = new cx * Cs + peer x"))
         module.add(SLShiftLeftB32(dst=sgpr(sT), shiftHex=hex(log2ck), src=sgpr(sT), comment="new cy * Ck"))

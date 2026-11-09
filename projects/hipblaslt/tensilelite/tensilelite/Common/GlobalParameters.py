@@ -706,6 +706,13 @@ defaultBenchmarkCommonParameters = [
     # half of the cluster grid. -1 disables;
     # -2 reads each cluster's XCC from the hardware. When active, the runtime
     # WorkGroupMapping orders clusters inside each half in bands of |WGM| clusters.
+    # 中文說明：ClusterAIDMapping 啟用時（-2），cluster kernel 的 WorkGroupMapping 不再被忽略，
+    # 改成「在每個 AID 那一半裡」做 WGM 式的 band 排序，單位是 cluster（不是 WG）：
+    #   |WGM| <= 1：維持 row-major；|WGM| = H > 1：每條 band 高 H 個 cluster
+    #   （例如 ClusterDim 4x4 時，WGM 2 = 2 列 cluster = 8 列 WG）；
+    #   WGM > 0 沿 cy 切 band，WGM < 0 沿 cx 切 band（跟 DefaultWGM 的正負號慣例一致）。
+    # band 不會跨過兩半的邊界，所以每個 AID 仍然只碰自己那一半、只用自己那份 GL2。
+    # WGM 是 runtime kernel 參數，可以不重新編 kernel 直接換值（例如 GemmTuning::setWgm）。
     {"ClusterAIDMapping": [-1]},
     {"HalfPLR": [0]},
     {"TDMIterateMode": [0]}
