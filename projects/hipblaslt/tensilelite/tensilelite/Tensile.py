@@ -46,7 +46,7 @@ from .Common.Architectures import ARCH_BUILD_ALIASES, architectureMap, archNameF
                                          baseArchName, capOverrideKeyOf, detectGlobalCurrentArch, \
                                          gfxToIsa, steppingArchOf, verifyTargetIdQualifiers
 from .Common.Capabilities import applyArchCapOverrides, makeIsaInfoMap
-from .Common.GlobalParameters import globalParameters, assignGlobalParameters, \
+from .Common.GlobalParameters import globalParameters, assignGlobalParameters, detectComputePartition, \
                                             restoreDefaultGlobalParameters, validateRuntimeLanguage
 from .Common.TimingInstrumentation import timing_context, flush_timing_buffer
 from .ExecutionPolicy import normalize_hybrid_assignment_policy
@@ -836,6 +836,10 @@ def Tensile(userArgs):
     isaInfoMap = makeIsaInfoMap(isaList, cxxCompiler)
     applyArchCapOverrides(isaInfoMap, archNames)
     assignGlobalParameters(config.get("GlobalParameters", {}), isaInfoMap)
+
+    if globalParameters["ComputePartition"] is None and not buildOnly and not globalParameters["CpuOnly"]:
+        globalParameters["ComputePartition"] = detectComputePartition(device_id)
+        print1("# Compute partition of device %s: %s" % (device_id, globalParameters["ComputePartition"]))
 
     # A stepping shares its ISA with the base arch, so the ISA-derived name would
     # send StinkyTofu to the wrong cost table; pass the concrete name instead.

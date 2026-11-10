@@ -1659,6 +1659,15 @@ class Solution(collections.abc.Mapping):
     state["ClusterBarrier"] = bool(clusterPeersShareTiles and state["TDMInst"] != 0
                                    and isaInfoMap[state["ISA"]].asmCaps.get("HasClusterBarrier", False))
 
+    # ClusterAIDRemap assumes 8 XCCs over two AIDs; under DPX/QPX/CPX the partition has at
+    # most one AID, l stops being a bijection and tiles are skipped or computed twice.
+    partition = globalParameters["ComputePartition"]
+    if state.get("ClusterAIDMapping", -1) != -1 and partition not in (None, "SPX"):
+      reject(state, printRejectionReason,
+             "ClusterAIDMapping=%d requires an SPX compute partition, device is %s"
+             % (state["ClusterAIDMapping"], partition))
+      # state["ClusterAIDMapping"] = -1
+
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
 

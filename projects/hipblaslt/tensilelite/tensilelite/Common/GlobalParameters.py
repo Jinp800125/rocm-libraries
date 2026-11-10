@@ -25,6 +25,7 @@
 import itertools
 import os.path
 import subprocess
+import sys
 import time
 from collections import OrderedDict
 from copy import deepcopy
@@ -299,6 +300,9 @@ globalParameters["LibraryUpdateComment"] = (
 
 # internal, i.e., gets set during startup
 globalParameters["AMDSMIPath"] = None  # /usr/bin/amd-smi
+# Compute partition of the tuning device ("SPX", "DPX", ...). Detected in Tensile.py
+# when left unset; None means unknown and gates nothing.
+globalParameters["ComputePartition"] = None
 globalParameters["HipClangVersion"] = "0.0.0"
 
 # default runtime is selected based on operating system, user can override
@@ -1034,6 +1038,51 @@ def assignGlobalParameters(config, isaInfoMap: Dict[IsaVersion, IsaInfo]):
         if key in ignoreKeys:
             continue
         globalParameters[key] = config[key]
+
+
+def _importAmdSmi():
+    """The amdsmi Python module, from site-packages or the ROCm install, or None."""
+    try:
+        import amdsmi
+        return amdsmi
+    except ImportError:
+        pass
+    amdSmiDir = os.path.join(globalParameters["ROCmPath"], "share", "amd_smi")
+    if not os.path.isdir(amdSmiDir):
+        return None
+    sys.path.append(amdSmiDir)
+    try:
+        import amdsmi
+        return amdsmi
+    except ImportError:
+        return None
+
+
+def detectComputePartition(device):
+    """The compute partition ("SPX", "DPX", ...) of ``device`` from amdsmi, or None.
+
+    ``device`` indexes amdsmi's processor handles, which follow the HIP device order
+    only when HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES do not reorder devices.
+    """
+    amdsmi = _importAmdSmi()
+    if amdsmi is None:
+        printWarning("Could not import amdsmi; the compute partition is unknown")
+        return None
+    try:
+        amdsmi.amdsmi_init(amdsmi.AmdSmiInitFlags.INIT_AMD_GPUS)
+    except Exception as e:
+        printWarning("amdsmi_init failed (%s); the compute partition is unknown" % e)
+        return None
+    try:
+        handle = amdsmi.amdsmi_get_processor_handles()[device]
+        profile = amdsmi.amdsmi_get_gpu_accelerator_partition_profile(handle)
+        partition = profile["partition_profile"]["profile_type"]
+        return partition if partition != "N/A" else None
+    except Exception as e:
+        printWarning("Could not read the compute partition of device %s (%s)" % (device, e))
+        return None
+    finally:
+        amdsmi.amdsmi_shut_down()
 
 
 def setupRestoreClocks():
