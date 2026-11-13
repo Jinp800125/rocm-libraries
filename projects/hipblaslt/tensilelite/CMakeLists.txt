@@ -217,6 +217,16 @@ if(TENSILELITE_ENABLE_HOST)
         target_compile_definitions(tensilelite-host PRIVATE HIPBLASLT_ENABLE_MXDATAGENERATOR)
     endif()
 
+    # Optional: the AID count of the compute partition (HipAMDGPU::numAIDs) comes from
+    # amd_smi; without it numAIDs stays 0 and ClusterAIDMapping=-2 kernels skip the remap.
+    if(NOT amd_smi_FOUND)
+        find_package(amd_smi QUIET)
+    endif()
+    if(amd_smi_FOUND)
+        target_link_libraries(tensilelite-host PRIVATE $<BUILD_INTERFACE:amd_smi>)
+        target_compile_definitions(tensilelite-host PRIVATE TENSILELITE_HAS_AMD_SMI)
+    endif()
+
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_INCLUDES ${HIP_INCLUDE_DIRS})
     set(CMAKE_REQUIRED_LIBRARIES hip::device)

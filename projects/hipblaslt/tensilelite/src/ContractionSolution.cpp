@@ -2629,6 +2629,20 @@ namespace TensileLite
                 }
                 else
                 {
+                    // Cluster kernels skip wgmXCC, so ClusterAIDRemap reads the partition's
+                    // XCC count from wgmxcc(21:16) and its AID count from wgmxccg(31:22)
+                    // instead; 0 (unknown) in either makes the remap skip.
+                    if(sizeMapping.clusterDim.x * sizeMapping.clusterDim.y > 1)
+                    {
+                        auto const* hipAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(hardware);
+                        wgmxcc = (hipAMDGPU && hipAMDGPU->analyticalHardware)
+                                     ? hipAMDGPU->analyticalHardware->NUM_XCD
+                                     : 0;
+                        wgmxccg = hipAMDGPU ? hipAMDGPU->numAIDs : 0;
+                        if(wgmxcc > 0x3F || wgmxccg <= 0 || wgmxccg > 0x3FF
+                           || wgmxcc % static_cast<size_t>(wgmxccg) != 0)
+                            wgmxcc = wgmxccg = 0;
+                    }
                     // Old bit layout: wgmxccg(31:22) | wgmxcc(21:16) | wgm(15:0)
                     internalArg1 = internalArg1 | (wgmxccg << 22) | (wgmxcc << 16) | (mask16 & wgm);
                 }

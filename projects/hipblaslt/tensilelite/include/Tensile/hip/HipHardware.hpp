@@ -56,6 +56,11 @@ namespace TensileLite
 
             std::shared_ptr<origami::hardware_t> analyticalHardware;
 
+            // AIDs (and so GL2s) in the device's current compute partition, e.g. 2 for
+            // gfx1250 SPX and 1 for DPX/QPX/CPX. 0 means unknown (no amd_smi, or the
+            // query failed).
+            int numAIDs = 0;
+
             virtual std::string archName() const override;
         };
 

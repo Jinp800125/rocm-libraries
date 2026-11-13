@@ -29,10 +29,17 @@
 #include <Tensile/hip/HipHardware.hpp>
 #include <Tensile/hip/HipUtils.hpp>
 
+#ifdef TENSILELITE_HAS_AMD_SMI
+#include <amd_smi/amdsmi.h>
+#endif
+
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace TensileLite
 {
@@ -61,6 +68,67 @@ namespace TensileLite
                 std::string const name = AMDGPU::toString(AMDGPU::toProcessor(prop.gcnArchName));
                 std::snprintf(base.gcnArchName, sizeof(base.gcnArchName), "%s", name.c_str());
                 return base;
+            }
+
+            // AIDs of the whole chip; compute partitions split them evenly.
+            int chipAIDs(AMDGPU::Processor processor)
+            {
+                return processor == AMDGPU::Processor::gfx1250 ? 2 : 1;
+            }
+
+#ifdef TENSILELITE_HAS_AMD_SMI
+            int queryPartitionAIDs(int deviceId, int aidsPerChip)
+            {
+                char busId[32] = {};
+                if(hipDeviceGetPCIBusId(busId, sizeof(busId), deviceId) != hipSuccess)
+                    return 0;
+                unsigned domain = 0, bus = 0, device = 0, function = 0;
+                if(std::sscanf(busId, "%x:%x:%x.%x", &domain, &bus, &device, &function) != 4)
+                    return 0;
+                amdsmi_bdf_t bdf    = {};
+                bdf.domain_number   = domain;
+                bdf.bus_number      = bus;
+                bdf.device_number   = device;
+                bdf.function_number = function;
+
+                // amdsmi_init/amdsmi_shut_down are reference counted, so this does not
+                // tear down an amd_smi session the application holds.
+                if(amdsmi_init(AMDSMI_INIT_AMD_GPUS) != AMDSMI_STATUS_SUCCESS)
+                    return 0;
+                int                                    aids    = 0;
+                amdsmi_processor_handle                handle  = nullptr;
+                amdsmi_accelerator_partition_profile_t profile = {};
+                uint32_t partitionIds[AMDSMI_MAX_ACCELERATOR_PARTITIONS] = {};
+                if(amdsmi_get_processor_handle_from_bdf(bdf, &handle) == AMDSMI_STATUS_SUCCESS
+                   && amdsmi_get_gpu_accelerator_partition_profile(handle, &profile, partitionIds)
+                          == AMDSMI_STATUS_SUCCESS
+                   && profile.num_partitions > 0)
+                    aids = std::max(1, aidsPerChip / static_cast<int>(profile.num_partitions));
+                amdsmi_shut_down();
+                return aids;
+            }
+#endif
+
+            // AIDs in deviceId's current compute partition, 0 if unknown. HipAMDGPU is
+            // rebuilt on every GetCurrentDevice() (e.g. per ext-op call), so the amd_smi
+            // query is cached per device; the partition cannot change while a process
+            // holds the GPU.
+            int partitionAIDs(int deviceId, AMDGPU::Processor processor)
+            {
+                int const aidsPerChip = chipAIDs(processor);
+                if(aidsPerChip <= 1)
+                    return aidsPerChip;
+#ifdef TENSILELITE_HAS_AMD_SMI
+                static std::mutex                   cacheMutex;
+                static std::unordered_map<int, int> cache;
+                std::lock_guard<std::mutex>         lock(cacheMutex);
+                auto                                it = cache.find(deviceId);
+                if(it == cache.end())
+                    it = cache.emplace(deviceId, queryPartitionAIDs(deviceId, aidsPerChip)).first;
+                return it->second;
+#else
+                return 0;
+#endif
             }
         } // namespace
 
@@ -101,6 +169,7 @@ namespace TensileLite
                                                                     analyticalProp,
                                                                     pciChipId));
             }
+            numAIDs = partitionAIDs(deviceId, processor);
         }
 
         std::string HipAMDGPU::archName() const

@@ -97,7 +97,7 @@ def test_cluster_padding_gfx1250_emits_early_exit_and_reduced_mask():
     )
     assert results[0][0] != results[1][0], "ClusterAIDMapping=-2 shares the -1 kernel name"
     base, src = remapped[0]
-    for marker in ("MSG_RTN_GET_SE_AID_ID", "grid is whole clusters?", "Nc % 8 == 0?",
+    for marker in ("MSG_RTN_GET_SE_AID_ID", "grid is whole clusters?", "Nc % X == 0?",
                    "ClusterAIDSplitN", "ClusterAIDSplitM"):
         assert marker in src, f"Kernel {base!r}: AID remap missing {marker!r}"
 

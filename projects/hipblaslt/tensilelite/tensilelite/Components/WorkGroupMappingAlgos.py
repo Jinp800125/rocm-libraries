@@ -334,7 +334,7 @@ def DefaultWGM(writer, kernel, sgprWGM, wg0="WorkGroup0", wg1="WorkGroup1"):
     if clusterEnabled(kernel["ClusterDim"]):
       # tmpWGM holds the decoded, signed WGM; ClusterAIDRemap uses it as the band height in
       # clusters, then the WG-unit WGM below is skipped so the order is not applied twice.
-      module.add(ClusterAIDRemap(writer, kernel, tmpWGM))
+      module.add(ClusterAIDRemap(writer, kernel, tmpWGM, sgprWGM))
       module.add(SBranch(wgmLabel.getLabelName()))
 
     module.add(SCmpGtI32(src0=sgpr(tmpWGM), src1=1, comment="WGM > 1 ?"))
@@ -404,40 +404,44 @@ def DefaultWGM(writer, kernel, sgprWGM, wg0="WorkGroup0", wg1="WorkGroup1"):
 
     return module
 
-def ClusterAIDRemap(writer, kernel, sgprWGM):
-    """Permute cluster ids so each AID's GL2 serves a contiguous half of the cluster grid.
+def ClusterAIDRemap(writer, kernel, sgprWGM, sgprInternalArgs1):
+    """Permute cluster ids so each AID's GL2 serves a contiguous part of the cluster grid.
 
-    Clusters are dispatched round-robin over 8 XCCs; XCCs [0,4) and [4,8) form the two AIDs,
-    each with its own GL2. With ClusterAIDMapping == -2 each cluster reads its xcc from
-    MSG_RTN_GET_SE_AID_ID. For dispatch id c = cx + Cx*cy over a Cx x Cy cluster grid with
-    Nc = Cx*Cy:
-        aid = xcc // 4
-        l   = aid*(Nc/2) + (c//8)*4 + xcc%4
+    The compute partition has X XCCs over A AIDs, each AID with its own GL2 (gfx1250 SPX:
+    X = 8, A = 2). The host passes X in bits [21:16] and A in bits [31:22] of
+    sgprInternalArgs1 (the wgmxcc / wgmxccg fields, unused by cluster kernels). XCC ids are
+    assumed to be 0..X-1 with each AID owning P = X/A consecutive ids.
+
+    Clusters are dispatched round-robin over the X XCCs. With ClusterAIDMapping == -2 each
+    cluster reads its xcc from MSG_RTN_GET_SE_AID_ID. For dispatch id c = cx + Cx*cy over a
+    Cx x Cy cluster grid with Nc = Cx*Cy:
+        aid = xcc // P
+        l   = aid*(Nc/A) + (c//X)*P + xcc%P
     If the hardware dispatch is strictly round-robin over XCCs within the launch, then
-    xcc = (c + s) % 8 for a fixed starting XCC s, every block of 8 consecutive ids covers
-    all 8 XCCs, and l is a bijection of [0, Nc). Each AID then gets
-    the l range of one half of the grid, split along N (both GL2s read all of A, B is read
-    once) or along M, whichever duplicates the smaller operand. Peer positions inside a
-    cluster are kept, so multicast masks are unaffected.
+    xcc = (c + s) % X for a fixed starting XCC s, every block of X consecutive ids covers
+    all X XCCs, and l is a bijection of [0, Nc). Each AID then gets the l range of one of A
+    equal parts of the grid, split along N (every GL2 reads all of A, B is read once) or
+    along M, whichever duplicates the smaller operand. Peer positions inside a cluster are
+    kept, so multicast masks are unaffected.
 
-    The runtime WorkGroupMapping then orders clusters inside each half, in cluster units:
+    The runtime WorkGroupMapping then orders clusters inside each part, in cluster units:
     |WGM| <= 1 keeps row-major order; otherwise H = |WGM| and, as in DefaultWGM, WGM > 0
-    bands along cy and WGM < 0 along cx. For a half of Lp clusters along the banded dim
-    and Lq along the other, with j = l - aid*Nc/2, b = j // (H*Lq), r = j % (H*Lq),
+    bands along cy and WGM < 0 along cx. For a part of Lp clusters along the banded dim
+    and Lq along the other, with j = l - aid*Nc/A, b = j // (H*Lq), r = j % (H*Lq),
     h = min(H, Lp - b*H): p = b*H + r % h, q = r // h. Any W consecutive l then cover a
     (W/H) x H block instead of a 1 x W strip.
 
-    Skipped at runtime unless the grid is a whole number of clusters and Nc % 8 == 0.
+    Skipped at runtime unless A > 1 (DPX/QPX/CPX have a single AID), GSU == 1, the grid is
+    a whole number of clusters, Nc % X == 0 and Cy or Cx is a multiple of A.
     """
     module = Module("ClusterAIDRemap")
     start = kernel["ClusterAIDMapping"]
     cs, ck = kernel["ClusterDim"]
     if start == -1 or isPersistent(kernel) or cs & (cs - 1) or ck & (ck - 1):
         return module
-    numXCC, xccPerAID = 8, 4
     log2cs, log2ck = int(log2(cs)), int(log2(ck))
 
-    module.addComment1("remap clusters onto AIDs: one contiguous half of the cluster grid per GL2")
+    module.addComment1("remap clusters onto AIDs: one contiguous part of the cluster grid per GL2")
     labelEnd    = Label(writer.labels.getNameInc("ClusterAIDRemapEnd"), "")
     labelSplitM = Label(writer.labels.getNameInc("ClusterAIDSplitM"), "")
     labelSplitN = Label(writer.labels.getNameInc("ClusterAIDSplitN"), "")
@@ -447,16 +451,34 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
     labelBand   = Label(writer.labels.getNameInc("ClusterAIDBand"), "")
     labelBandN  = Label(writer.labels.getNameInc("ClusterAIDBandN"), "")
     labelBandM  = Label(writer.labels.getNameInc("ClusterAIDBandM"), "")
+    labelCanSplitN = Label(writer.labels.getNameInc("ClusterAIDCanSplitN"), "")
 
-    # The first 6 sgprs are used by the remap itself; band ordering adds
-    #   sS = split direction (0 = split N, 1 = split M), sJ = index j inside the half,
+    # sX = X, sA = A, sAid = aid of this cluster; sPart = Nc/A.
+    # sS / sJ hold Cy % A / Cx % A until the split dim is chosen; band ordering then reuses
+    #   sS = split direction (0 = split N, 1 = split M), sJ = index j inside the part,
     #   sQ = H = |WGM|, sR = divisor / band height h.
-    # WGM is only known at runtime, so all 10 are always allocated.
-    with writer.allocTmpSgpr(10, tag="ClusterAIDRemap") as tmp:
-        sCx, sCy, sHalf, sL, sT, sP = range(tmp.idx, tmp.idx + 6)
+    # X, A and WGM are only known at runtime, so all 13 are always allocated.
+    with writer.allocTmpSgpr(13, tag="ClusterAIDRemap") as tmp:
+        sCx, sCy, sPart, sL, sT, sP = range(tmp.idx, tmp.idx + 6)
         sS, sJ, sQ, sR = range(tmp.idx + 6, tmp.idx + 10)
+        sX, sA, sAid = range(tmp.idx + 10, tmp.idx + 13)
+
+        tmpVgpr = writer.vgprPool.checkOutAligned(4, 2, "ClusterAIDRemap_div")
+        tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
+
+        # divide(q, d, div, r): unsigned sgpr division, q = d // div, r = d % div; q may alias d.
+        # Uses the 4 tmp vgprs above and is exact only for 24-bit values (cluster counts are far
+        # below 2^24); it resets EXEC and may clobber SCC, so do not reuse a compare across it.
+        def divide(q, d, div, r):
+            return scalarUInt24DivideAndRemainder(qReg=q, dReg=d, divReg=div, rReg=r, tmpVgprRes=tmpVgprRes,
+                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True)
 
         # ---- preconditions: otherwise skip the remap and keep the original cluster order ----
+        module.add(SLShiftRightB32(dst=sgpr(sX), shiftHex=hex(16), src=sgpr(sgprInternalArgs1), comment="X = XCCs in the partition [21:16]"))
+        module.add(SAndB32(dst=sgpr(sX), src0=sgpr(sX), src1=hex(0x3F)))
+        module.add(SLShiftRightB32(dst=sgpr(sA), shiftHex=hex(22), src=sgpr(sgprInternalArgs1), comment="A = AIDs in the partition [31:22]"))
+        module.add(SCmpGtU32(src0=sgpr(sA), src1=1, comment="more than one AID?"))
+        module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
         if kernel["GlobalSplitU"] != 0:
             module.add(SAndB32(dst=sgpr(sT), src0=sgpr("GSU"), src1=writer.gsuMaskHex(kernel), comment="Restore GSU"))
             module.add(SCmpEQU32(src0=sgpr(sT), src1=1, comment="GSU == 1?"))
@@ -468,11 +490,16 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
         module.add(SLShiftRightB32(dst=sgpr(sCx), shiftHex=hex(log2cs), src=sgpr("NumWorkGroups0"), comment="Cx"))
         module.add(SLShiftRightB32(dst=sgpr(sCy), shiftHex=hex(log2ck), src=sgpr("NumWorkGroups1"), comment="Cy"))
-        module.add(SMulI32(dst=sgpr(sHalf), src0=sgpr(sCx), src1=sgpr(sCy), comment="Nc"))
-        module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sHalf), src1=hex(numXCC - 1)))
-        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Nc % 8 == 0?"))
+        module.add(SMulI32(dst=sgpr(sPart), src0=sgpr(sCx), src1=sgpr(sCy), comment="Nc"))
+        module.add(divide(sT, sPart, sX, sP))
+        module.add(SCmpEQU32(src0=sgpr(sP), src1=0, comment="Nc % X == 0?"))
         module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
-        module.add(SLShiftRightB32(dst=sgpr(sHalf), shiftHex=hex(1), src=sgpr(sHalf), comment="Nc / 2"))
+        module.add(divide(sT, sCy, sA, sS))
+        module.add(divide(sT, sCx, sA, sJ))
+        module.add(SMinU32(dst=sgpr(sT), src0=sgpr(sS), src1=sgpr(sJ), comment="min(Cy % A, Cx % A)"))
+        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="N or M splits into A whole parts?"))
+        module.add(SCBranchSCC0(labelName=labelEnd.getLabelName()))
+        module.add(divide(sPart, sPart, sA, sT))
 
         # ---- dispatch id c of this cluster; keep only the peer position in WorkGroup0/1 ----
         module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2ck), src=sgpr("WorkGroup1"), comment="cy"))
@@ -482,54 +509,43 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(SAndB32(dst=sgpr("WorkGroup0"), src0=sgpr("WorkGroup0"), src1=hex(cs - 1), comment="peer x"))
         module.add(SAndB32(dst=sgpr("WorkGroup1"), src0=sgpr("WorkGroup1"), src1=hex(ck - 1), comment="peer y"))
 
-        # ---- XCC this cluster runs on ----
+        # ---- l = aid*Nc/A + (c//X)*P + xcc%P with P = X/A, aid = xcc//P:
+        #      [aid*Nc/A, (aid+1)*Nc/A) belongs to AID aid ----
+        module.add(divide(sQ, sX, sA, sR))
+        module.add(divide(sT, sL, sX, sR))
+        module.add(SMulI32(dst=sgpr(sL), src0=sgpr(sT), src1=sgpr(sQ), comment="(c // X) * P"))
         module.add(SSendMsgRtnB32(dst=sgpr(sP), src=135, comment="MSG_RTN_GET_SE_AID_ID, [31:16] = XCC"))
         module.add(SWaitCnt(kmcnt=0, comment="wait SE_AID_ID"))
-        module.add(SLShiftRightB32(dst=sgpr(sP), shiftHex=hex(16), src=sgpr(sP)))
-        module.add(SAndB32(dst=sgpr(sP), src0=sgpr(sP), src1=hex(numXCC - 1), comment="xcc from hardware"))
-
-        # ---- l = aid*Nc/2 + (c//8)*4 + xcc%4: [0, Nc/2) belongs to AID0, [Nc/2, Nc) to AID1 ----
-        module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(log2(xccPerAID)), src=sgpr(sP), comment="aid"))
-        module.add(SMulI32(dst=sgpr(sT), src0=sgpr(sT), src1=sgpr(sHalf), comment="aid * Nc/2"))
-        module.add(SLShiftRightB32(dst=sgpr(sL), shiftHex=hex(log2(numXCC)), src=sgpr(sL), comment="c // 8"))
-        module.add(SLShiftLeftB32(dst=sgpr(sL), shiftHex=hex(log2(xccPerAID)), src=sgpr(sL), comment="(c // 8) * 4"))
-        module.add(SAndB32(dst=sgpr(sP), src0=sgpr(sP), src1=hex(xccPerAID - 1), comment="xcc % 4"))
-        module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sP)))
-        module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sT), comment="l = aid*Nc/2 + (c//8)*4 + xcc%4"))
+        module.add(SLShiftRightB32(dst=sgpr(sP), shiftHex=hex(16), src=sgpr(sP), comment="xcc from hardware"))
+        module.add(divide(sAid, sP, sQ, sR))
+        module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sR), comment="+ xcc % P"))
+        module.add(SMulI32(dst=sgpr(sT), src0=sgpr(sAid), src1=sgpr(sPart), comment="aid * Nc/A"))
+        module.add(SAddU32(dst=sgpr(sL), src0=sgpr(sL), src1=sgpr(sT), comment="l = aid*Nc/A + (c//X)*P + xcc%P"))
 
         # ---- choose the split dim (split N along cy, split M along cx) ----
-        module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCy), src1=1))
-        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cy even: N split keeps halves whole"))
-        module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
-        module.add(SAndB32(dst=sgpr(sT), src0=sgpr(sCx), src1=1))
-        module.add(SCmpEQU32(src0=sgpr(sT), src1=0, comment="Cx even: M split keeps halves whole"))
+        module.add(SCmpEQU32(src0=sgpr(sS), src1=0, comment="Cy % A == 0: N split keeps parts whole"))
+        module.add(SCBranchSCC1(labelName=labelCanSplitN.getLabelName()))
+        module.add(SBranch(labelName=labelSplitM.getLabelName()))
+        module.add(labelCanSplitN)
+        module.add(SCmpEQU32(src0=sgpr(sJ), src1=0, comment="Cx % A == 0: M split keeps parts whole"))
         module.add(SCBranchSCC0(labelName=labelSplitN.getLabelName()))
         module.add(SMulI32(dst=sgpr(sT), src0=sgpr("NumWorkGroups0"), src1=kernel["MacroTile0"], comment="M (A rows)"))
         module.add(SMulI32(dst=sgpr(sP), src0=sgpr("NumWorkGroups1"), src1=kernel["MacroTile1"], comment="N (B cols)"))
         module.add(SCmpLeU32(src0=sgpr(sT), src1=sgpr(sP), comment="duplicate the smaller operand"))
         module.add(SCBranchSCC0(labelName=labelSplitM.getLabelName()))
 
-        tmpVgpr = writer.vgprPool.checkOutAligned(4, 2, "ClusterAIDRemap_div")
-        tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=4)
-
-        # divide(q, d, div, r): unsigned sgpr division, q = d // div, r = d % div.
-        # Uses the 4 tmp vgprs above and is exact only for 24-bit values (cluster counts are far
-        # below 2^24); it may clobber SCC, so do not reuse a compare across it.
-        def divide(q, d, div, r):
-            return scalarUInt24DivideAndRemainder(qReg=q, dReg=d, divReg=div, rReg=r, tmpVgprRes=tmpVgprRes,
-                                                  wavewidth=kernel["WavefrontSize"], doRemainder=True)
-
         def skipToBandIfWGM(label):
             # Branch to the band path only if H = |WGM| > 1; otherwise fall through to row-major.
             # sQ carries H into wgmBandedOrder.
             module.add(SAbsI32(dst=sgpr(sQ), src=sgpr(sgprWGM), comment="H = |WGM|"))
-            module.add(SCmpGtU32(src0=sgpr(sQ), src1=1, comment="WGM bands inside the half?"))
+            module.add(SCmpGtU32(src0=sgpr(sQ), src1=1, comment="WGM bands inside the part?"))
             module.add(SCBranchSCC1(labelName=label.getLabelName()))
 
         def wgmBandedOrder():
-            # in: sCx = F, sCy = S, sS = 0 (split N) / 1 (split M), sQ = H; out: sP = cx, sT = cy
+            # in: sCx = F, sCy = S, sS = 0 (split N) / 1 (split M), sQ = H, sAid = aid;
+            # out: sP = cx, sT = cy
             # Shared by split N and split M:
-            #   1. find the half of l: index j inside the half and the offset aid*S
+            #   1. l lies in part aid: index j inside the part and the offset aid*S
             #   2. pick the banded dim: sT = (WGM < 0) xor (split M)
             #        sT == 0: bands along the split dim (Lp = S, Lq = F)
             #        sT == 1: bands along the other dim (Lp = F, Lq = S)
@@ -541,11 +557,10 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
             # Branch-free: s_cselect does not touch SCC, so one compare can drive two selects.
             # sCx / sCy hold F / S on entry; the original Cx / Cy are dead, labelApply reads only sP / sT.
 
-            # ---- step 1: which half l is in: j and aid*S ----
-            module.add(SCmpGeU32(src0=sgpr(sL), src1=sgpr(sHalf), comment="aid 1?"))
-            module.add(SCSelectB32(dst=sgpr(sJ), src0=sgpr(sHalf), src1=0))
-            module.add(SCSelectB32(dst=sgpr(sHalf), src0=sgpr(sCy), src1=0, comment="aid * S"))
-            module.add(SSubU32(dst=sgpr(sJ), src0=sgpr(sL), src1=sgpr(sJ), comment="j = l - aid*Nc/2"))
+            # ---- step 1: j and aid*S ----
+            module.add(SMulI32(dst=sgpr(sJ), src0=sgpr(sAid), src1=sgpr(sPart)))
+            module.add(SSubU32(dst=sgpr(sJ), src0=sgpr(sL), src1=sgpr(sJ), comment="j = l - aid*Nc/A"))
+            module.add(SMulI32(dst=sgpr(sPart), src0=sgpr(sAid), src1=sgpr(sCy), comment="aid * S"))
 
             # ---- step 2: pick the banded dim: Lp / Lq ----
             module.add(SCmpGtI32(src0=sgpr(sgprWGM), src1=0, comment="WGM > 0: bands along cy"))
@@ -570,16 +585,16 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
 
             # ---- step 6: (p, q) to (split-dim coord, other coord) ----
             module.add(SCmpEQU32(src0=sgpr(sT), src1=0))
-            module.add(SCSelectB32(dst=sgpr(sP), src0=sgpr(sJ), src1=sgpr(sL), comment="split-dim coord in half"))
+            module.add(SCSelectB32(dst=sgpr(sP), src0=sgpr(sJ), src1=sgpr(sL), comment="split-dim coord in part"))
             module.add(SCSelectB32(dst=sgpr(sR), src0=sgpr(sL), src1=sgpr(sJ), comment="other coord"))
-            module.add(SAddU32(dst=sgpr(sP), src0=sgpr(sP), src1=sgpr(sHalf), comment="+ aid * S"))
+            module.add(SAddU32(dst=sgpr(sP), src0=sgpr(sP), src1=sgpr(sPart), comment="+ aid * S"))
 
             # ---- step 7: (split dim, other dim) to (cx, cy) ----
             module.add(SCmpEQU32(src0=sgpr(sS), src1=0, comment="split N?"))
             module.add(SCSelectB32(dst=sgpr(sT), src0=sgpr(sP), src1=sgpr(sR), comment="cy"))
             module.add(SCSelectB32(dst=sgpr(sP), src0=sgpr(sR), src1=sgpr(sP), comment="cx"))
 
-        # split N halves along cy with F = Cx; split M halves along cx with F = Cy.
+        # split N cuts cy into A parts with F = Cx; split M cuts cx into A parts with F = Cy.
         # Both leave sP = new cx, sT = new cy for labelApply. Each branch checks the runtime WGM
         # first: band order goes to BandN / BandM, otherwise row-major.
         module.add(labelSplitN)
@@ -591,16 +606,16 @@ def ClusterAIDRemap(writer, kernel, sgprWGM):
         module.add(divide(sP, sL, sCy, sT))
         module.add(SBranch(labelName=labelApply.getLabelName()))
 
-        # wgmBandedOrder inputs: sCx = F (undivided dim), sCy = S (half length along the split dim),
+        # wgmBandedOrder inputs: sCx = F (undivided dim), sCy = S (part length along the split dim),
         # sS = split direction.
         module.add(labelBandN)
-        module.add(SLShiftRightB32(dst=sgpr(sCy), shiftHex=hex(1), src=sgpr(sCy), comment="S = Cy / 2"))
-        module.add(SMovB32(dst=sgpr(sS), src=0, comment="split N"))
+        module.add(divide(sCy, sCy, sA, sR))
+        module.add(SMovB32(dst=sgpr(sS), src=0, comment="split N, S = Cy / A"))
         module.add(SBranch(labelName=labelBand.getLabelName()))
         module.add(labelBandM)
-        module.add(SLShiftRightB32(dst=sgpr(sT), shiftHex=hex(1), src=sgpr(sCx)))
+        module.add(divide(sT, sCx, sA, sR))
         module.add(SMovB32(dst=sgpr(sCx), src=sgpr(sCy), comment="F = Cy"))
-        module.add(SMovB32(dst=sgpr(sCy), src=sgpr(sT), comment="S = Cx / 2"))
+        module.add(SMovB32(dst=sgpr(sCy), src=sgpr(sT), comment="S = Cx / A"))
         module.add(SMovB32(dst=sgpr(sS), src=1, comment="split M"))
         module.add(labelBand)
         wgmBandedOrder()
